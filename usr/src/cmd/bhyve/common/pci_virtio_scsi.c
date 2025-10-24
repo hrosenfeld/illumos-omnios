@@ -217,7 +217,8 @@ pci_vtscsi_reset(void *vsc)
 	/* initialize config structure */
 	sc->vss_config = sc->vss_default_config;
 
-	sc->vss_config.max_target = MAX(1, sc->vss_num_target) - 1;
+	/* Workaround Windows driver bug #1442 */
+	/* sc->vss_config.max_target = MAX(1, sc->vss_num_target) - 1; */
 
 	sc->vss_backend->vsb_reset(sc);
 }
