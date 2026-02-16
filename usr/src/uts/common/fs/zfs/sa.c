@@ -687,11 +687,36 @@ sa_build_layouts(sa_handle_t *hdl, sa_bulk_attr_t *attr_desc, int attr_count,
 	/* setup and size spill buffer when needed */
 	if (spilling) {
 		boolean_t dummy;
+		boolean_t first_spill = B_FALSE;
 
 		if (hdl->sa_spill == NULL) {
 			VERIFY(dmu_spill_hold_by_bonus(hdl->sa_bonus, 0, NULL,
 			    &hdl->sa_spill) == 0);
+			first_spill = B_TRUE;
 		}
+
+		/*
+		 * When transitioning from no-spill to spill for the first
+		 * time, the DN_SPILL_BLKPTR region at the end of the bonus
+		 * buffer may contain stale SA attribute data from a previous
+		 * layout. Zero it to prevent the ZIO pipeline from interpreting
+		 * stale data as a block pointer.
+		 *
+		 * Bug: smbsrv ACL writes that trigger a bonus-to-spill
+		 * transition can leave FILE_ALL_ACCESS(0x001f01ff) access
+		 * mask data in the blkptr_t region, which decodes to an
+		 * invalid vdev and causes a panic in dva_get_dsize_sync().
+		 */
+		if (first_spill) {
+			dmu_buf_impl_t *bdb = (dmu_buf_impl_t*)hdl->sa_bonus;
+			dnode_t*dn;
+
+			DB_DNODE_ENTER(bdb);
+			dn = DB_DNODE(bdb);
+			BP_ZERO(DN_SPILL_BLKPTR(dn->dn_phys));
+			DB_DNODE_EXIT(bdb);
+		}
+
 		dmu_buf_will_dirty(hdl->sa_spill, tx);
 
 		spillhdrsize = sa_find_sizes(sa, &attr_desc[i],
