@@ -308,6 +308,22 @@
 .Op Fl p Ar prop Ns Cm \&= Ns Ar value Ns Op ,...
 .Ar vnic-link
 .Nm
+.Cm modify-vnic
+.Op Fl t
+.Op Fl R Ar root-dir
+.Fl l Ar link
+.Oo
+.Fl m
+.Ar value |
+.Cm auto |
+.Cm factory Fl n Ar slot-id |
+.Cm random Oo Fl r Ar prefix Oc |
+.Cm vrrp Fl V Ar vrid Fl A Ar address-family
+.Oc
+.Op Fl v Ar vid Op Fl f
+.Op Fl p Ar prop Ns Cm \&= Ns Ar value Ns Op ,...
+.Ar vnic-link
+.Nm
 .Cm delete-vnic
 .Op Fl t
 .Op Fl R Ar root-dir
@@ -2921,6 +2937,30 @@ flag.
 .Xc
 A comma-separated list of properties to set to the specified values.
 .El
+.It Xo
+.Nm Cm modify-vnic
+.Op Fl t
+.Op Fl R Ar root-dir
+.Fl l Ar link
+.Oo
+.Fl m
+.Ar value |
+.Cm auto |
+.Cm factory Fl n Ar slot-id |
+.Cm random Oo Fl r Ar prefix Oc |
+.Cm vrrp Fl V Ar vrid Fl A Ar address-family
+.Oc
+.Op Fl v Ar vid Op Fl f
+.Op Fl p Ar prop Ns Cm \&= Ns Ar value Ns Op ,...
+.Ar vnic-link
+.Xc
+.Pp
+Modify the VNIC with name
+.Ar vnic-link .
+.Pp
+The options are the same as for the
+.Cm create-vnic
+subcommand.
 .It Xo
 .Nm Cm delete-vnic
 .Op Fl t

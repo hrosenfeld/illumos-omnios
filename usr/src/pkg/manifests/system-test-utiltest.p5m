@@ -1381,6 +1381,7 @@ file path=opt/util-tests/tests/dis/sparc/tst.regs.s mode=0444
 dir  path=opt/util-tests/tests/dladm
 file path=opt/util-tests/tests/dladm/allowed-ips mode=0555
 file path=opt/util-tests/tests/dladm/create-vnic mode=0555
+file path=opt/util-tests/tests/dladm/modify-vnic mode=0555
 file path=opt/util-tests/tests/dladm/set-linkprop mode=0555
 file path=opt/util-tests/tests/dladm/show-class-confusion mode=0555
 file path=opt/util-tests/tests/dladm/show-overlay-exit mode=0555

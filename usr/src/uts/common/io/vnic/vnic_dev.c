@@ -114,6 +114,7 @@ static void vnic_cleanup_secondary_macs(vnic_t *, int);
 static int vnic_set_secondary_macs(vnic_t *, mac_secondary_addr_t *);
 static int vnic_get_secondary_macs(vnic_t *, uint_t, void *);
 
+static void vnic_notify_cb(void *, mac_notify_type_t);
 static void vnic_notify_lower_cb(void *, mac_notify_type_t);
 
 static kmem_cache_t	*vnic_cache;
@@ -561,6 +562,103 @@ vnic_lower_close(vnic_t *vnic)
 		mac_close(vnic->vn_lower_mh);
 }
 
+void
+vnic_lower_modify(vnic_t *vnic)
+{
+	vnic_ioc_t *ioc = vnic->vn_modify_ioc;
+	mac_resource_props_t *mrp;
+	boolean_t reuse_mac_slot = B_FALSE;
+	int err;
+
+	if (vnic->vn_modify_done)
+		return;
+
+	vnic->vn_modify_done = B_TRUE;
+
+	/* Check whether we're reusing the same factory MAC address. */
+	if (ioc->vi_mac_addr_type == VNIC_MAC_ADDR_TYPE_FACTORY &&
+	    vnic->vn_addr_type == VNIC_MAC_ADDR_TYPE_FACTORY &&
+	    ioc->vi_mac_slot == vnic->vn_slot_id)
+		reuse_mac_slot = B_TRUE;
+
+	/*
+	 * Remove the previous unicast address and the associated data
+	 * paths and flows, else we'll fail due to collisions.
+	 */
+	vnic_cleanup_secondary_macs(vnic, vnic->vn_nhandles);
+	VERIFY0(mac_unicast_remove(vnic->vn_mch, vnic->vn_muh));
+	vnic->vn_muh = NULL;
+
+	/* Make a copy of the vnic_t in case we need to restore it. */
+	bcopy(vnic, vnic->vn_orig_vnic, sizeof (vnic_t));
+
+	/* Setup new lower MAC as vnic_dev_create() would do. */
+	err = vnic_lower_open(vnic, ioc, reuse_mac_slot);
+	if (err != 0)
+		goto fail_open;
+
+	err = vnic_lower_setup(vnic, ioc, &vnic->vn_mtu);
+	if (err != 0) {
+		goto fail_setup;
+	}
+
+	/*
+	 * Copy our original resources from the lower MAC, then apply
+	 * any new resources we have been given in the modify request.
+	 */
+	mrp = kmem_zalloc(sizeof (*mrp), KM_SLEEP);
+	mac_client_get_resources(vnic->vn_orig_vnic->vn_mch, mrp);
+	mac_set_upper_mac(vnic->vn_mch, vnic->vn_mh, NULL);
+	err = mac_client_set_resources(vnic->vn_mch, mrp);
+	kmem_free(mrp, sizeof (*mrp));
+	if (err != 0)
+		goto fail;
+
+	err = mac_client_set_resources(vnic->vn_mch, &ioc->vi_resource_props);
+	if (err != 0)
+		goto fail;
+
+	/*
+	 * The modification was successful. Tell clients to reopen their
+	 * client handles, and update link state and capabilities based on
+	 * new lower MAC.
+	 */
+	vnic->vn_modify_error = 0;
+
+	mac_notify_reopen(vnic->vn_mh);
+
+	vnic->vn_ls = mac_client_stat_get(vnic->vn_mch, MAC_STAT_LINK_STATE);
+	mac_link_update(vnic->vn_mh, vnic->vn_ls);
+
+	mac_capab_update(vnic->vn_mh);
+
+	return;
+
+fail:
+	vnic_lower_teardown(vnic, reuse_mac_slot);
+
+fail_setup:
+	vnic_lower_close(vnic);
+
+fail_open:
+	/* Restore the original vnic_t */
+	bcopy(vnic->vn_orig_vnic, vnic, sizeof (vnic_t));
+
+	/* Restore the original MAC address. */
+	ioc->vi_mac_addr_type = vnic->vn_addr_type;
+	ioc->vi_mac_len = vnic->vn_addr_len;
+	bcopy(vnic->vn_addr, ioc->vi_mac_addr, ioc->vi_mac_len);
+	ioc->vi_mac_slot = vnic->vn_slot_id;
+	ioc->vi_vrid = vnic->vn_vrid;
+	ioc->vi_af = vnic->vn_af;
+	ioc->vi_vid = vnic->vn_vid;
+
+	VERIFY0(vnic_unicast_add(ioc, vnic->vn_lower_mh, vnic->vn_mch,
+	    &vnic->vn_muh, reuse_mac_slot));
+
+	vnic->vn_modify_error = err;
+}
+
 /*
  * Create a new VNIC upon request from administrator.
  * Returns 0 on success, an errno on failure.
@@ -593,6 +691,12 @@ vnic_dev_create(vnic_ioc_t *ioc, cred_t *credp)
 	}
 
 	bzero(vnic, sizeof (*vnic));
+
+	mutex_init(&vnic->vn_lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&vnic->vn_modify_cv, NULL, CV_DRIVER, NULL);
+	cv_init(&vnic->vn_switch_cv, NULL, CV_DRIVER, NULL);
+	list_create(&vnic->vn_upper_list, sizeof (vnic_upper_t),
+	    offsetof(vnic_upper_t, vu_list_node));
 
 	vnic->vn_ls = LINK_STATE_UNKNOWN;
 	vnic->vn_id = ioc->vi_vnic_id;
@@ -655,6 +759,15 @@ vnic_dev_create(vnic_ioc_t *ioc, cred_t *credp)
 		goto bail;
 
 	if (!is_anchor) {
+		/* register to receive our own notifications */
+		vnic->vn_mnh = mac_notify_add(vnic->vn_mh, vnic_notify_cb,
+		    vnic);
+
+		vnic->vn_taskq = taskq_create(mac_name(vnic->vn_mh), 1,
+		    minclsyspri, 3, 512, TASKQ_DYNAMIC);
+		if (vnic->vn_taskq == NULL)
+			goto bail;
+
 		/* Set the VNIC's MAC in the client */
 		mac_set_upper_mac(vnic->vn_mch, vnic->vn_mh,
 		    &ioc->vi_resource_props);
@@ -718,6 +831,14 @@ bail:
 		vnic_lower_close(vnic);
 	}
 
+	if (vnic->vn_taskq != NULL)
+		taskq_destroy(vnic->vn_taskq);
+
+	VERIFY(list_is_empty(&vnic->vn_upper_list));
+	VERIFY0(vnic->vn_hold_cnt);
+	list_destroy(&vnic->vn_upper_list);
+	mutex_destroy(&vnic->vn_lock);
+
 	kmem_cache_free(vnic_cache, vnic);
 	return (err);
 }
@@ -729,7 +850,24 @@ bail:
 int
 vnic_dev_modify(vnic_ioc_t *ioc, cred_t *credp)
 {
-	vnic_t *vnic = NULL;
+	vnic_t *vnic;
+	int err;
+
+	/* We don't work on etherstub vnics. */
+	if ((ioc->vi_flags & VNIC_IOC_FLAGS_ANCHOR) != 0)
+		return (ENOTSUP);
+
+	/* We also don't work on VLAN vnics. */
+	if (ioc->vi_mac_addr_type == VNIC_MAC_ADDR_TYPE_PRIMARY)
+		return (ENOTSUP);
+
+	if ((ioc->vi_resource_props.mrp_mask & MRP_RX_RINGS) != 0 ||
+	    (ioc->vi_resource_props.mrp_mask & MRP_TX_RINGS) != 0) {
+		ioc->vi_diag = VNIC_IOC_DIAG_NO_HWRINGS;
+		return (ENOTSUP);
+	}
+
+	ioc->vi_diag = VNIC_IOC_DIAG_NONE;
 
 	rw_enter(&vnic_lock, RW_WRITER);
 
@@ -739,9 +877,93 @@ vnic_dev_modify(vnic_ioc_t *ioc, cred_t *credp)
 		return (ENOENT);
 	}
 
+	mutex_enter(&vnic->vn_lock);
+	if (vnic->vn_modifying) {
+		mutex_exit(&vnic->vn_lock);
+		rw_exit(&vnic_lock);
+		return (EBUSY);
+	}
+
+	/* Allocate a 2nd vnic_t for error recovery. */
+	vnic->vn_orig_vnic = kmem_cache_alloc(vnic_cache, KM_NOSLEEP);
+	if (vnic->vn_orig_vnic == NULL) {
+		mutex_exit(&vnic->vn_lock);
+		rw_exit(&vnic_lock);
+		return (ENOMEM);
+	}
+
+	/* No new link ID given, use existing. */
+	if (ioc->vi_link_id == DATALINK_INVALID_LINKID) {
+		ioc->vi_link_id = vnic->vn_link_id;
+	}
+
+	/* No new VLAN ID given, use existing. */
+	if (ioc->vi_vid == VLAN_ID_NONE)
+		ioc->vi_vid = MAC_VLAN_UNTAGGED_VID(vnic->vn_vid);
+
+	/* No new MAC address given, use existing. */
+	if (ioc->vi_mac_addr_type == VNIC_MAC_ADDR_TYPE_UNKNOWN) {
+		ioc->vi_mac_addr_type = vnic->vn_addr_type;
+		ioc->vi_mac_len = vnic->vn_addr_len;
+		bcopy(vnic->vn_addr, ioc->vi_mac_addr, ioc->vi_mac_len);
+		ioc->vi_mac_slot = vnic->vn_slot_id;
+		ioc->vi_vrid = vnic->vn_vrid;
+		ioc->vi_af = vnic->vn_af;
+	}
+
+	if (ioc->vi_vid == VLAN_ID_UNTAGGED)
+		ioc->vi_vid = VLAN_ID_NONE;
+
+	VERIFY0(vnic->vn_modify_cnt);
+	VERIFY0(vnic->vn_modifying);
+	vnic->vn_modifying = B_TRUE;
+	vnic->vn_modify_done = B_FALSE;
+	vnic->vn_modify_error = ENOTSUP;
+	vnic->vn_modify_ioc = ioc;
+
+	if (mac_has_vnic_primary_client(vnic->vn_mh)) {
+		/*
+		 * Notify clients that they'll need to replumb their streams.
+		 */
+		vnic->vn_modify_cnt = vnic->vn_hold_cnt;
+		vnic->vn_replumb_done = B_FALSE;
+		mac_notify_replumb(vnic->vn_mh);
+
+		while (!vnic->vn_replumb_done || vnic->vn_modify_cnt > 0)
+			cv_wait(&vnic->vn_modify_cv, &vnic->vn_lock);
+	}
+
+	/*
+	 * If the modification wasn't performed already as part of the REPLUMB
+	 * notification processing, do it now.
+	 */
+	if (!vnic->vn_modify_done)
+		vnic_lower_modify(vnic);
+
+	err = vnic->vn_modify_error;
+
+	if (err != 0)
+		goto out;
+
+	vnic_lower_teardown(vnic->vn_orig_vnic, B_FALSE);
+	vnic_lower_close(vnic->vn_orig_vnic);
+
+out:
+	kmem_cache_free(vnic_cache, vnic->vn_orig_vnic);
+	vnic->vn_orig_vnic = NULL;
+	vnic->vn_modify_ioc = NULL;
+	vnic->vn_modify_cnt = 0;
+	vnic->vn_modify_error = 0;
+	vnic->vn_modify_done = B_FALSE;
+	vnic->vn_modifying = B_FALSE;
+	vnic->vn_replumb_done = B_FALSE;
+	cv_signal(&vnic->vn_switch_cv);
+	mutex_exit(&vnic->vn_lock);
 	rw_exit(&vnic_lock);
 
-	return (0);
+	ioc->vi_vid = MAC_VLAN_UNTAGGED_VID(vnic->vn_vid);
+
+	return (err);
 }
 
 /* ARGSUSED */
@@ -789,12 +1011,20 @@ vnic_dev_delete(vnic_ioc_t *ioc, cred_t *credp)
 	vnic_count--;
 	rw_exit(&vnic_lock);
 
+	if (vnic->vn_mnh != NULL)
+		(void) mac_notify_remove(vnic->vn_mnh, B_TRUE);
+
 	/*
 	 * XXX-nicolas shouldn't have a void cast here, if it's
 	 * expected that the function will never fail, then we should
 	 * have an ASSERT().
 	 */
 	(void) mac_unregister(vnic->vn_mh);
+
+	VERIFY(list_is_empty(&vnic->vn_upper_list));
+	VERIFY0(vnic->vn_hold_cnt);
+	list_destroy(&vnic->vn_upper_list);
+	mutex_destroy(&vnic->vn_lock);
 
 	if (vnic->vn_lower_mh != NULL) {
 		vnic_lower_teardown(vnic, B_FALSE);
@@ -1374,6 +1604,34 @@ vnic_m_propinfo(void *m_driver, const char *pr_name,
 		break;
 	default:
 		break;
+	}
+}
+
+/*
+ * Callback to receive our own notifications. As this callback is requested
+ * first when the vnic is created, it'll be called last by MAC to deliver
+ * the notification. Hence we know all our clients have been notified already
+ * when we get here.
+ */
+static void
+vnic_notify_cb(void *arg, mac_notify_type_t type)
+{
+	vnic_t *vnic = arg;
+
+	/*
+	 * Ignore notifications if the vnic is not fully initialized or is in
+	 * process of being torn down.
+	 */
+	if (!vnic->vn_enabled)
+		return;
+
+	/* Also, these notifications only make sense when we're modifying. */
+	if (!vnic->vn_modifying)
+		return;
+
+	if (type == MAC_NOTE_REPLUMB) {
+		vnic->vn_replumb_done = B_TRUE;
+		cv_signal(&vnic->vn_modify_cv);
 	}
 }
 

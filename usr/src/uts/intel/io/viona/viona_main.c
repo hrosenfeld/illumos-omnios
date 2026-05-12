@@ -37,6 +37,7 @@
  * Copyright 2019 Joyent, Inc.
  * Copyright 2022 OmniOS Community Edition (OmniOSce) Association.
  * Copyright 2025 Oxide Computer Company
+ * Copyright 2026 Hans Rosenfeld
  */
 
 /*
@@ -333,6 +334,8 @@ static int viona_ioc_ring_intr_clear(viona_link_t *, uint_t);
 static int viona_ioc_intr_poll(viona_link_t *, void *, int, int *);
 
 static void viona_params_get_defaults(viona_link_params_t *);
+
+static void viona_notify(void *, mac_notify_type_t);
 
 static struct cb_ops viona_cb_ops = {
 	viona_open,
@@ -921,6 +924,8 @@ viona_ioc_create(viona_soft_state_t *ss, void *dptr, int md, cred_t *cr)
 		goto bail;
 	}
 
+	link->l_mnh = mac_notify_add(link->l_mh, viona_notify, link);
+
 	viona_ring_alloc(link, &link->l_vrings[VIONA_VQ_RX]);
 	viona_ring_alloc(link, &link->l_vrings[VIONA_VQ_TX]);
 	rings_allocd = B_TRUE;
@@ -954,6 +959,8 @@ viona_ioc_create(viona_soft_state_t *ss, void *dptr, int md, cred_t *cr)
 bail:
 	if (link != NULL) {
 		viona_rx_clear(link);
+		if (link->l_mnh != NULL)
+			(void) mac_notify_remove(link->l_mnh, B_TRUE);
 		if (link->l_mch != NULL) {
 			if (link->l_muh != NULL) {
 				VERIFY0(mac_unicast_remove(link->l_mch,
@@ -1027,6 +1034,8 @@ viona_ioc_delete(viona_soft_state_t *ss, boolean_t on_close)
 
 	mutex_enter(&ss->ss_lock);
 	viona_kstat_fini(ss);
+	if (link->l_mnh != NULL)
+		(void) mac_notify_remove(link->l_mnh, B_TRUE);
 	if (link->l_mch != NULL) {
 		/* Unhook the receive callbacks and close out the client */
 		viona_rx_clear(link);
@@ -1529,4 +1538,38 @@ viona_ioc_intr_poll(viona_link_t *link, void *udata, int md, int *rv)
 	}
 	*rv = (int)cnt;
 	return (0);
+}
+
+static void
+viona_notify(void *arg, mac_notify_type_t type)
+{
+	viona_link_t *link = (viona_link_t *)arg;
+	viona_soft_state_t *ss = link->l_ss;
+	mac_client_handle_t mch;
+	mac_diag_t diag;
+
+	if (!mac_is_vnic(link->l_mh))
+		return;
+
+	mutex_enter(&ss->ss_lock);
+
+	switch (type) {
+	case MAC_NOTE_REPLUMB:
+		viona_rx_clear(link);
+		VERIFY0(mac_unicast_remove(link->l_mch, link->l_muh));
+		break;
+
+	case MAC_NOTE_REOPEN:
+		VERIFY0(mac_client_open(link->l_mh, &mch, NULL, 0));
+		(void) atomic_swap_ptr(&link->l_mch, mch);
+		VERIFY0(mac_unicast_add(link->l_mch, NULL, MAC_UNICAST_PRIMARY,
+		    &link->l_muh, VLAN_ID_NONE, &diag));
+		(void) viona_rx_set(link, link->l_promisc);
+		break;
+
+	default:
+		break;
+	}
+
+	mutex_exit(&ss->ss_lock);
 }

@@ -24,6 +24,7 @@
  * Copyright 2019 Joyent, Inc.
  * Copyright 2017 RackTop Systems.
  * Copyright 2022 OmniOS Community Edition (OmniOSce) Association.
+ * Copyright 2026 Hans Rosenfeld
  */
 
 /*
@@ -4575,6 +4576,28 @@ mac_is_vnic_primary(mac_handle_t mh)
 	    VNIC_MAC_ADDR_TYPE_PRIMARY);
 }
 
+boolean_t
+mac_has_vnic_primary_client(mac_handle_t mh)
+{
+	mac_impl_t *mip = (mac_impl_t *)mh;
+	mac_client_impl_t *mcip;
+
+	ASSERT(mac_is_vnic(mh));
+
+	i_mac_perim_enter(mip);
+	mcip = mip->mi_clients_list;
+
+	if (mcip != NULL &&
+	    (mcip->mci_flags & MAC_CLIENT_FLAGS_VNIC_PRIMARY) != 0) {
+		i_mac_perim_exit(mip);
+		return (B_TRUE);
+	}
+
+	i_mac_perim_exit(mip);
+	return (B_FALSE);
+}
+
+
 void
 mac_update_resources(mac_resource_props_t *nmrp, mac_resource_props_t *cmrp,
     boolean_t is_user_flow)
@@ -5391,6 +5414,22 @@ mac_virtual_link_update(mac_impl_t *mip)
 {
 	if (mip->mi_linkstate != LINK_STATE_UP)
 		i_mac_notify(mip, MAC_NOTE_LINK);
+}
+
+void
+mac_notify_reopen(mac_handle_t mh)
+{
+	mac_impl_t *mip = (mac_impl_t *)mh;
+
+	i_mac_notify(mip, MAC_NOTE_REOPEN);
+}
+
+void
+mac_notify_replumb(mac_handle_t mh)
+{
+	mac_impl_t *mip = (mac_impl_t *)mh;
+
+	i_mac_notify(mip, MAC_NOTE_REPLUMB);
 }
 
 /*

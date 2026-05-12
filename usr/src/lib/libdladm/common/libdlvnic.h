@@ -21,6 +21,7 @@
 /*
  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
+ * Copyright 2026 EFit Partners S.R.L.
  */
 
 #ifndef _LIBDLVNIC_H
@@ -55,7 +56,8 @@ typedef struct dladm_vnic_attr {
 extern dladm_status_t	dladm_vnic_create(dladm_handle_t, const char *,
 			    dladm_vnic_attr_t *, dladm_arg_list_t *,
 			    dladm_errlist_t *, uint32_t);
-
+extern dladm_status_t	dladm_vnic_modify(dladm_handle_t, dladm_vnic_attr_t *,
+			    dladm_arg_list_t *, dladm_errlist_t *, uint32_t);
 extern dladm_status_t	dladm_vnic_delete(dladm_handle_t, datalink_id_t,
 			    uint32_t);
 extern dladm_status_t	dladm_vnic_info(dladm_handle_t, datalink_id_t,
