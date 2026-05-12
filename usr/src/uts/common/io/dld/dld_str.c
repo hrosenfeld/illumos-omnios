@@ -21,6 +21,7 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2023 Oxide Computer Company
+ * Copyright 2026 Hans Rosenfeld
  */
 
 /*
@@ -1776,6 +1777,33 @@ str_notify_allowed_ips(dld_str_t *dsp)
 }
 
 /*
+ * DL_NOTIFY_IND: DL_NOTE_REPLUMB
+ */
+static void
+str_notify_replumb(dld_str_t *dsp)
+{
+	dl_notify_ind_t *dlip;
+	mblk_t *mp;
+
+	if (!(dsp->ds_notifications & DL_NOTE_REPLUMB))
+		return;
+
+	if (!mac_is_vnic(dsp->ds_mh))
+		return;
+
+	if ((mp = mexchange(dsp->ds_wq, NULL, sizeof (dl_notify_ind_t),
+	    M_PROTO, 0)) == NULL)
+		return;
+
+	bzero(mp->b_rptr, sizeof (dl_notify_ind_t));
+	dlip = (dl_notify_ind_t *)mp->b_rptr;
+	dlip->dl_primitive = DL_NOTIFY_IND;
+	dlip->dl_notification = DL_NOTE_REPLUMB;
+
+	qreply(dsp->ds_wq, mp);
+}
+
+/*
  * MAC notification callback.
  */
 void
@@ -1902,12 +1930,17 @@ str_notify(void *arg, mac_notify_type_t type)
 		str_notify_fastpath_flush(dsp);
 		break;
 
-	/* Unused notifications */
-	case MAC_NOTE_MARGIN:
-		break;
-
 	case MAC_NOTE_ALLOWED_IPS:
 		str_notify_allowed_ips(dsp);
+		break;
+
+	case MAC_NOTE_REPLUMB:
+		str_notify_replumb(dsp);
+		break;
+
+	/* Unused notifications */
+	case MAC_NOTE_MARGIN:
+	case MAC_NOTE_REOPEN:
 		break;
 
 	default:

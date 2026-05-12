@@ -23,6 +23,7 @@
  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  * Copyright 2019 Joyent, Inc.
+ * Copyright 2026 Hans Rosenfeld
  */
 
 /*
@@ -158,6 +159,8 @@ extern	char *mac_client_name(mac_client_handle_t);
 extern int mac_open(const char *, mac_handle_t *);
 extern void mac_close(mac_handle_t);
 extern uint64_t mac_stat_get(mac_handle_t, uint_t);
+extern void mac_notify_reopen(mac_handle_t);
+extern void mac_notify_replumb(mac_handle_t);
 
 extern int mac_unicast_primary_set(mac_handle_t, const uint8_t *);
 extern void mac_unicast_primary_get(mac_handle_t, uint8_t *);

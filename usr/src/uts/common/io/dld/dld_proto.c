@@ -22,6 +22,7 @@
  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2012, Nexenta Systems, Inc. All rights reserved.
  * Copyright (c) 2018, Joyent, Inc.
+ * Copyright 2026 Hans Rosenfeld
  */
 
 /*
@@ -1158,7 +1159,8 @@ proto_notify_req(dld_str_t *dsp, mblk_t *mp)
 	    DL_NOTE_SPEED |
 	    DL_NOTE_SDU_SIZE|
 	    DL_NOTE_SDU_SIZE2|
-	    DL_NOTE_ALLOWED_IPS;
+	    DL_NOTE_ALLOWED_IPS|
+	    DL_NOTE_REPLUMB;
 
 	if (MBLKL(mp) < sizeof (dl_notify_req_t)) {
 		dl_err = DL_BADPRIM;

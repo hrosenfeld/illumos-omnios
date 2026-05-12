@@ -34,6 +34,9 @@ user = root
 [/opt/util-tests/tests/dladm/create-vnic]
 user = root
 
+[/opt/util-tests/tests/dladm/modify-vnic]
+user = root
+
 [/opt/util-tests/tests/dladm/set-linkprop]
 user = root
 

@@ -23,6 +23,7 @@
  * Copyright 2015, Joyent Inc.
  * Copyright 2020 OmniOS Community Edition (OmniOSce) Association.
  * Copyright 2026 Hans Rosenfeld
+ * Copyright 2026 EFit Partners S.R.L.
  */
 
 #include <stdio.h>
@@ -457,8 +458,8 @@ i_dladm_vnic_vrrp_mac(vrid_t vrid, int af, uint8_t *mac, uint_t maclen)
 }
 
 /*
- * Perform all the heavy lifting involved with creating a new VNIC / VLAN.
- * Update the configuration file and bring it up.
+ * Perform all the heavy lifting involved with creating a new VNIC / VLAN
+ * or modifying an existing VNIC. Update the configuration file and bring it up.
  *
  * The "vrid" and "af" arguments are only required if the mac_addr_type is
  * VNIC_MAC_ADDR_TYPE_VRID. In that case, the MAC address will be caculated
@@ -717,6 +718,53 @@ done:
 		if (status == DLADM_STATUS_OK && stat2 != DLADM_STATUS_OK)
 			status = stat2;
 	}
+	return (status);
+}
+
+/*
+ * Modify a VNIC.
+ */
+dladm_status_t
+dladm_vnic_modify(dladm_handle_t handle, dladm_vnic_attr_t *attrp,
+    dladm_arg_list_t *proplist, dladm_errlist_t *errs, uint32_t flags)
+{
+	dladm_conf_t conf = { 0 };
+	dladm_status_t status;
+	datalink_class_t class;
+	uint32_t vnic_flags;
+
+	/*
+	 * Can't modify an anchor VNIC (aka etherstub) or VLAN.
+	 */
+	if ((flags & (DLADM_OPT_ANCHOR | DLADM_OPT_VLAN)) != 0)
+		return (DLADM_STATUS_BADARG);
+
+	/*
+	 * Check datalink class and flags. We handle only VNICs,
+	 * and we don't do persistent configuration changes on temporary
+	 * links.
+	 */
+	status = dladm_datalink_id2info(handle, attrp->va_vnic_id, &vnic_flags,
+	    &class, NULL, NULL, 0);
+	if (status != DLADM_STATUS_OK)
+		return (status);
+
+	if (class != DATALINK_CLASS_VNIC)
+		return (DLADM_STATUS_BADARG);
+
+	if ((flags & DLADM_OPT_PERSIST) != 0) {
+		if ((vnic_flags & DLMGMT_PERSIST) == 0)
+			return (DLADM_STATUS_PERSIST_ON_TEMP);
+
+		/* Save vnic configuration and its properties */
+		status = dladm_open_conf(handle, attrp->va_vnic_id, &conf);
+		if (status != DLADM_STATUS_OK)
+			return (status);
+	}
+
+	status = i_dladm_vnic_common(handle, VNIC_IOC_MODIFY, attrp, class,
+	    proplist, errs, flags, NULL, conf);
+
 	return (status);
 }
 

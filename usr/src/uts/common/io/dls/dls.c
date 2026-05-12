@@ -26,6 +26,7 @@
 
 /*
  * Copyright 2019 Joyent, Inc.
+ * Copyright 2026 Hans Rosenfeld
  */
 
 /*
@@ -663,6 +664,24 @@ dls_mac_active_set(dls_link_t *dlp)
 		 */
 		mac_diag_t diag;
 
+		/*
+		 * If this is a vnic, update our client handle. This is
+		 * a no-op if the vnic hasn't been modified.
+		 */
+		if (mac_is_vnic(dlp->dl_mh)) {
+			/*
+			 * Since we know we're on a vnic, just pass 0 for flags
+			 * to mac_client_open() as the flags are ignored anyway.
+			 *
+			 * Also, don't bother with mac_client_lose() on the old
+			 * handle as it's a no-op for vnics and the old handle
+			 * may have been freed already.
+			 */
+			mac_client_handle_t mch;
+			VERIFY0(mac_client_open(dlp->dl_mh, &mch, NULL, 0));
+			(void) atomic_swap_ptr(&dlp->dl_mch, mch);
+		}
+
 		/* request the primary MAC address */
 		if ((err = mac_unicast_add(dlp->dl_mch, NULL,
 		    MAC_UNICAST_PRIMARY | MAC_UNICAST_TAG_DISABLE |
@@ -709,6 +728,9 @@ dls_active_set(dld_str_t *dsp)
 			return (EBUSY);
 		return (err);
 	}
+
+	/* Update our cached copy of the MAC client handle. */
+	dsp->ds_mch = dsp->ds_dlp->dl_mch;
 
 	dsp->ds_passivestate = DLD_ACTIVE;
 	dsp->ds_nactive++;

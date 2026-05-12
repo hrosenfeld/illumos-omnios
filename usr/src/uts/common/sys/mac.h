@@ -24,6 +24,7 @@
  * Copyright 2018 Joyent, Inc.
  * Copyright (c) 2015 Garrett D'Amore <garrett@damore.org>
  * Copyright 2020 RackTop Systems, Inc.
+ * Copyright 2026 Hans Rosenfeld
  */
 
 #ifndef	_SYS_MAC_H
@@ -415,6 +416,8 @@ typedef enum {
 	MAC_NOTE_CAPAB_CHG,
 	MAC_NOTE_LOWLINK,
 	MAC_NOTE_ALLOWED_IPS,
+	MAC_NOTE_REOPEN,
+	MAC_NOTE_REPLUMB,
 	MAC_NNOTE	/* must be the last entry */
 } mac_notify_type_t;
 
@@ -717,6 +720,7 @@ extern void			mac_stop_logusage(mac_logtype_t);
 
 extern mac_handle_t		mac_get_lower_mac_handle(mac_handle_t);
 extern boolean_t		mac_is_vnic_primary(mac_handle_t);
+extern boolean_t		mac_has_vnic_primary_client(mac_handle_t);
 
 /*
  * Packet hashing for distribution to multiple ports and rings.

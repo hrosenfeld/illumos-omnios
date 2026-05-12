@@ -22,6 +22,7 @@
  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  * Copyright 2019 Joyent, Inc.
+ * Copyright 2026 Hans Rosenfeld
  */
 
 /*
@@ -623,6 +624,25 @@ dls_link_notify(void *arg, mac_notify_type_t type)
 	nvlist_t	*nvp;
 	sysevent_t	*event;
 	sysevent_id_t	eid;
+
+	/*
+	 * Update our client handle if this is a VNIC. This is
+	 * a no-op if the vnic hasn't been modified.
+	 */
+	if (type == MAC_NOTE_REOPEN && mac_is_vnic(dlp->dl_mh)) {
+		/*
+		 * Since we know we're on a vnic, just pass 0 for flags
+		 * to mac_client_open() as the flags are ignored anyway.
+		 *
+		 * Also, don't bother with mac_client_lose() on the old
+		 * handle as it's a no-op for vnics and the old handle
+		 * may have been freed already.
+		 */
+		mac_client_handle_t mch;
+		VERIFY0(mac_client_open(dlp->dl_mh, &mch, NULL, 0));
+		(void) atomic_swap_ptr(&dlp->dl_mch, mch);
+		return;
+	}
 
 	if (type != MAC_NOTE_LINK && type != MAC_NOTE_LOWLINK)
 		return;

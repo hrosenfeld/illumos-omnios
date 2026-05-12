@@ -22,6 +22,7 @@
 # Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
 # Copyright 2015 Joyent, Inc.
 # Copyright 2020 OmniOS Community Edition (OmniOSce) Association.
+# Copyright 2026 Hans Rosenfeld
 #
 
 #
@@ -154,6 +155,7 @@ SYMBOL_VERSION SUNWprivate_1.1 {
 	dladm_wlan_wpa_set_key;
 	dladm_wlan_wpa_set_mlme;
 	dladm_vnic_create;
+	dladm_vnic_modify;
 	dladm_vnic_delete;
 	dladm_vnic_info;
 	dladm_vnic_str2macaddrtype;

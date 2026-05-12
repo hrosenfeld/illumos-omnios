@@ -29,6 +29,7 @@
  * Copyright 2024, 2026 H. William Welliver <william@welliver.org>
  * Copyright 2024 Oxide Computer Company
  * Copyright 2026 Hans Rosenfeld
+ * Copyright 2026 EFit Partners S.R.L.
  */
 
 #include <stdio.h>
@@ -224,7 +225,7 @@ static cmdfunc_t do_create_vlan, do_delete_vlan, do_up_vlan, do_show_vlan;
 static cmdfunc_t do_rename_link, do_delete_phys, do_init_phys;
 static cmdfunc_t do_show_linkmap;
 static cmdfunc_t do_show_ether;
-static cmdfunc_t do_create_vnic, do_delete_vnic, do_show_vnic;
+static cmdfunc_t do_create_vnic, do_modify_vnic, do_delete_vnic, do_show_vnic;
 static cmdfunc_t do_up_vnic;
 static cmdfunc_t do_create_part, do_delete_part, do_show_part, do_show_ib;
 static cmdfunc_t do_up_part;
@@ -402,6 +403,11 @@ static cmd_t	cmds[] = {
 	    "auto |\n"
 	    "\t\t     {factory [-n <slot-id>]} | {random [-r <prefix>]} |\n"
 	    "\t\t     {vrrp -V <vrid> -A {inet | inet6}}] [-v <vlan-id> [-f]]\n"
+	    "\t\t     [-p <prop>=<value>[,...]] <vnic-link>"		},
+	{ "modify-vnic",	do_modify_vnic,
+	    "    modify-vnic      [-t] [-l <link>] [-m <value> | auto |\n"
+	    "\t\t     {factory [-n <slot-id>]} | {random [-r <prefix>]} |\n"
+	    "\t\t     {vrrp -V <vrid> -A {inet | inet6}}] [-v <vid> [-f]]\n"
 	    "\t\t     [-p <prop>=<value>[,...]] <vnic-link>"		},
 	{ "delete-vnic",	do_delete_vnic,
 	    "    delete-vnic      [-t] [-R <root-dir>] <vnic-link>"	},
@@ -5003,9 +5009,42 @@ do_create_vnic_func(const char *name, const char *devname,
 }
 
 static void
+do_modify_vnic_func(const char *name, const char *devname,
+    dladm_vnic_attr_t *attrp, dladm_arg_list_t *proplist, uint32_t flags)
+{
+	dladm_status_t status;
+
+	status = dladm_name2info(handle, name, &attrp->va_vnic_id, NULL, NULL,
+	    NULL);
+	if (status != DLADM_STATUS_OK)
+		die("invalid link name '%s'", name);
+
+	status = dladm_vnic_modify(handle, attrp, proplist, &errlist, flags);
+
+	switch (status) {
+	case DLADM_STATUS_OK:
+		break;
+
+	case DLADM_STATUS_LINKBUSY:
+		die("VLAN over '%s' may not use default_tag ID "
+		    "(see dladm(8))", devname);
+		break;
+
+	default:
+		die_dlerrlist(status, &errlist, "vnic modification failed");
+	}
+}
+
+static void
 do_create_vnic(int argc, char *argv[], const char *use)
 {
 	do_common_vnic(argc, argv, use, do_create_vnic_func);
+}
+
+static void
+do_modify_vnic(int argc, char *argv[], const char *use)
+{
+	do_common_vnic(argc, argv, use, do_modify_vnic_func);
 }
 
 static void

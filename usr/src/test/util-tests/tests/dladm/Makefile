@@ -21,6 +21,7 @@ ROOTOPTPKG = $(ROOT)/opt/util-tests/tests/dladm
 
 PROG =	allowed-ips \
 	create-vnic \
+	modify-vnic \
 	set-linkprop \
 	show-class-confusion \
 	show-overlay-exit
