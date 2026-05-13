@@ -350,7 +350,7 @@ typedef enum {
  * future world as well; as 0xFFFF is not a valid TCI (the 0xFFF VID
  * is reserved and never transmitted across networks).
  */
-#define	MAC_VLAN_UNTAGGED		UINT16_MAX
+#define	MAC_VLAN_UNTAGGED		VLAN_ID_UNTAGGED
 #define	MAC_VLAN_UNTAGGED_VID(vid)	\
 	(((vid) == VLAN_ID_NONE) ? MAC_VLAN_UNTAGGED : (vid))
 

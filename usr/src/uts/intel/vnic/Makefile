@@ -23,6 +23,7 @@
 # Use is subject to license terms.
 #
 # Copyright (c) 2018, Joyent, Inc.
+# Copyright 2026 Hans Rosenfeld
 
 #
 # Path to the base of the uts directory tree (usually /usr/src/uts).
@@ -52,13 +53,8 @@ INSTALL_TARGET	= $(BINARY) $(ROOTMODULE) $(ROOT_CONFFILE)
 # Overrides
 #
 CFLAGS		+= $(CCVERBOSE)
+CFLAGS		+= -I $(SRC)/uts/common/sys
 LDFLAGS		+= -Ndrv/dld -Nmisc/mac -Nmisc/dls
-
-CERRWARN	+= -_gcc=-Wno-switch
-CERRWARN	+= $(CNOWARN_UNINIT)
-
-# needs work
-SMOFF += deref_check
 
 #
 #	Default build targets.

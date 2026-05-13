@@ -22,9 +22,11 @@
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2015, Joyent Inc.
  * Copyright 2020 OmniOS Community Edition (OmniOSce) Association.
+ * Copyright 2026 Hans Rosenfeld
  */
 
 #include <stdio.h>
+#include <sys/debug.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <string.h>
@@ -38,6 +40,7 @@
 #include <net/if_types.h>
 #include <net/if_dl.h>
 #include <sys/dld.h>
+#include <sys/vlan.h>
 #include <libdladm_impl.h>
 #include <libvrrpadm.h>
 #include <libdllink.h>
@@ -53,9 +56,6 @@
  */
 static char dladm_vnic_def_prefix[] = {0x02, 0x08, 0x20};
 
-static dladm_status_t	dladm_vnic_persist_conf(dladm_handle_t,
-			    const char *name, dladm_vnic_attr_t *,
-			    datalink_class_t);
 static const char	*dladm_vnic_macaddr2str(const uchar_t *, char *);
 static dladm_status_t	dladm_vnic_str2macaddr(const char *, uchar_t *);
 
@@ -100,57 +100,65 @@ dladm_vnic_diag2status(vnic_ioc_diag_t ioc_diag)
 }
 
 /*
- * Send a create command to the VNIC driver.
+ * Send an ioctl command to the VNIC driver.
  */
-dladm_status_t
-i_dladm_vnic_create_sys(dladm_handle_t handle, dladm_vnic_attr_t *attr)
+static dladm_status_t
+i_dladm_vnic_ioctl(dladm_handle_t handle, int cmd, dladm_vnic_attr_t *attrp,
+    boolean_t is_etherstub)
 {
 	int rc;
-	vnic_ioc_create_t ioc;
+	vnic_ioc_t ioc;
 	dladm_status_t status = DLADM_STATUS_OK;
 
 	bzero(&ioc, sizeof (ioc));
-	ioc.vc_vnic_id = attr->va_vnic_id;
-	ioc.vc_link_id = attr->va_link_id;
-	ioc.vc_mac_addr_type = attr->va_mac_addr_type;
-	ioc.vc_mac_len = attr->va_mac_len;
-	ioc.vc_mac_slot = attr->va_mac_slot;
-	ioc.vc_mac_prefix_len = attr->va_mac_prefix_len;
-	ioc.vc_vid = attr->va_vid;
-	ioc.vc_vrid = attr->va_vrid;
-	ioc.vc_af = attr->va_af;
-	ioc.vc_flags = attr->va_force ? VNIC_IOC_CREATE_FORCE : 0;
+	ioc.vi_vnic_id = attrp->va_vnic_id;
+	ioc.vi_link_id = attrp->va_link_id;
+	ioc.vi_mac_addr_type = attrp->va_mac_addr_type;
+	ioc.vi_mac_len = attrp->va_mac_len;
+	ioc.vi_mac_slot = attrp->va_mac_slot;
+	ioc.vi_mac_prefix_len = attrp->va_mac_prefix_len;
+	ioc.vi_vid = attrp->va_vid;
+	ioc.vi_vrid = attrp->va_vrid;
+	ioc.vi_af = attrp->va_af;
+	ioc.vi_force = attrp->va_force;
 
-	if (attr->va_mac_len > 0 || ioc.vc_mac_prefix_len > 0)
-		bcopy(attr->va_mac_addr, ioc.vc_mac_addr, MAXMACADDRLEN);
-	bcopy(&attr->va_resource_props, &ioc.vc_resource_props,
+	if (attrp->va_mac_len > 0 || ioc.vi_mac_prefix_len > 0) {
+		CTASSERT(sizeof (attrp->va_mac_addr) == MAXMACADDRLEN);
+		CTASSERT(sizeof (ioc.vi_mac_addr) == MAXMACADDRLEN);
+		bcopy(attrp->va_mac_addr, ioc.vi_mac_addr, MAXMACADDRLEN);
+	}
+
+	bcopy(&attrp->va_resource_props, &ioc.vi_resource_props,
 	    sizeof (mac_resource_props_t));
-	if (attr->va_link_id == DATALINK_INVALID_LINKID)
-		ioc.vc_flags |= VNIC_IOC_CREATE_ANCHOR;
 
-	rc = ioctl(dladm_dld_fd(handle), VNIC_IOC_CREATE, &ioc);
+	if (is_etherstub)
+		ioc.vi_flags |= VNIC_IOC_FLAGS_ANCHOR;
+
+	rc = ioctl(dladm_dld_fd(handle), cmd, &ioc);
 	if (rc < 0)
 		status = dladm_errno2status(errno);
 
 	if (status != DLADM_STATUS_OK) {
-		if (ioc.vc_diag != VNIC_IOC_DIAG_NONE)
-			status = dladm_vnic_diag2status(ioc.vc_diag);
-	}
-	if (status != DLADM_STATUS_OK)
+		if (ioc.vi_diag != VNIC_IOC_DIAG_NONE)
+			status = dladm_vnic_diag2status(ioc.vi_diag);
 		return (status);
-
-	attr->va_mac_addr_type = ioc.vc_mac_addr_type;
-	switch (ioc.vc_mac_addr_type) {
-	case VNIC_MAC_ADDR_TYPE_FACTORY:
-		attr->va_mac_slot = ioc.vc_mac_slot;
-		break;
-	case VNIC_MAC_ADDR_TYPE_RANDOM:
-		bcopy(ioc.vc_mac_addr, attr->va_mac_addr, MAXMACADDRLEN);
-		attr->va_mac_len = ioc.vc_mac_len;
-		break;
-	default:
-		break;
 	}
+
+	attrp->va_vnic_id = ioc.vi_vnic_id;
+	attrp->va_link_id = ioc.vi_link_id;
+	attrp->va_mac_addr_type = ioc.vi_mac_addr_type;
+	bcopy(ioc.vi_mac_addr, attrp->va_mac_addr, MAXMACADDRLEN);
+	attrp->va_mac_len = ioc.vi_mac_len;
+	attrp->va_mac_slot = ioc.vi_mac_slot;
+	attrp->va_mac_prefix_len = ioc.vi_mac_prefix_len;
+	attrp->va_vid = ioc.vi_vid;
+	attrp->va_vrid = ioc.vi_vrid;
+	attrp->va_af = ioc.vi_af;
+	attrp->va_force = ioc.vi_force;
+
+	bcopy(&ioc.vi_resource_props, &attrp->va_resource_props,
+	    sizeof (mac_resource_props_t));
+
 	return (status);
 }
 
@@ -161,35 +169,9 @@ static dladm_status_t
 i_dladm_vnic_info_active(dladm_handle_t handle, datalink_id_t linkid,
     dladm_vnic_attr_t *attrp)
 {
-	vnic_ioc_info_t ioc;
-	vnic_info_t *vnic;
-	int rc;
-	dladm_status_t status = DLADM_STATUS_OK;
+	attrp->va_vnic_id = linkid;
 
-	bzero(&ioc, sizeof (ioc));
-	vnic = &ioc.vi_info;
-	vnic->vn_vnic_id = linkid;
-
-	rc = ioctl(dladm_dld_fd(handle), VNIC_IOC_INFO, &ioc);
-	if (rc != 0) {
-		status = dladm_errno2status(errno);
-		goto bail;
-	}
-
-	attrp->va_vnic_id = vnic->vn_vnic_id;
-	attrp->va_link_id = vnic->vn_link_id;
-	attrp->va_mac_addr_type = vnic->vn_mac_addr_type;
-	bcopy(vnic->vn_mac_addr, attrp->va_mac_addr, MAXMACADDRLEN);
-	attrp->va_mac_len = vnic->vn_mac_len;
-	attrp->va_mac_slot = vnic->vn_mac_slot;
-	attrp->va_mac_prefix_len = vnic->vn_mac_prefix_len;
-	attrp->va_vid = vnic->vn_vid;
-	attrp->va_vrid = vnic->vn_vrid;
-	attrp->va_af = vnic->vn_af;
-	attrp->va_force = vnic->vn_force;
-
-bail:
-	return (status);
+	return (i_dladm_vnic_ioctl(handle, VNIC_IOC_INFO, attrp, B_FALSE));
 }
 
 static dladm_status_t
@@ -282,7 +264,8 @@ i_dladm_vnic_info_persist(dladm_handle_t handle, datalink_id_t linkid,
 
 	status = dladm_get_conf_field(handle, conf, FVLANID, &u64,
 	    sizeof (u64));
-	attrp->va_vid = ((status == DLADM_STATUS_OK) ?  (uint16_t)u64 : 0);
+	attrp->va_vid = ((status == DLADM_STATUS_OK) ?
+	    (uint16_t)u64 : VLAN_ID_UNTAGGED);
 
 	status = DLADM_STATUS_OK;
 done:
@@ -305,20 +288,15 @@ dladm_vnic_info(dladm_handle_t handle, datalink_id_t linkid,
 /*
  * Remove a VNIC from the kernel.
  */
-dladm_status_t
+static dladm_status_t
 i_dladm_vnic_delete_sys(dladm_handle_t handle, datalink_id_t linkid)
 {
-	vnic_ioc_delete_t ioc;
-	dladm_status_t status = DLADM_STATUS_OK;
-	int rc;
+	vnic_ioc_t ioc;
 
-	ioc.vd_vnic_id = linkid;
+	bzero(&ioc, sizeof (ioc));
+	ioc.vi_vnic_id = linkid;
 
-	rc = ioctl(dladm_dld_fd(handle), VNIC_IOC_DELETE, &ioc);
-	if (rc < 0)
-		status = dladm_errno2status(errno);
-
-	return (status);
+	return (ioctl(dladm_dld_fd(handle), VNIC_IOC_DELETE, &ioc));
 }
 
 /*
@@ -369,6 +347,92 @@ dladm_vnic_str2macaddrtype(const char *str, vnic_mac_addr_type_t *val)
 	return (DLADM_STATUS_BADARG);
 }
 
+static dladm_status_t
+i_dladm_vnic_attr2conf(dladm_handle_t handle, dladm_vnic_attr_t *attrp,
+    dladm_conf_t conf, datalink_class_t class)
+{
+	dladm_status_t status;
+	uint64_t u64;
+
+	if (attrp->va_link_id != DATALINK_INVALID_LINKID) {
+		char linkover[MAXLINKNAMELEN];
+
+		status = dladm_datalink_id2info(handle, attrp->va_link_id, NULL,
+		    NULL, NULL, linkover, sizeof (linkover));
+		if (status != DLADM_STATUS_OK)
+			return (status);
+
+		status = dladm_set_conf_field(handle, conf, FLINKOVER,
+		    DLADM_TYPE_STR, linkover);
+		if (status != DLADM_STATUS_OK)
+			return (status);
+	}
+
+	if (class != DATALINK_CLASS_VLAN &&
+	    attrp->va_mac_addr_type != VNIC_MAC_ADDR_TYPE_UNKNOWN) {
+		char macstr[ETHERADDRL * 3];
+
+		u64 = attrp->va_mac_addr_type;
+		status = dladm_set_conf_field(handle, conf, FMADDRTYPE,
+		    DLADM_TYPE_UINT64, &u64);
+		if (status != DLADM_STATUS_OK)
+			return (status);
+
+		u64 = attrp->va_vrid;
+		status = dladm_set_conf_field(handle, conf, FVRID,
+		    DLADM_TYPE_UINT64, &u64);
+		if (status != DLADM_STATUS_OK)
+			return (status);
+
+		u64 = attrp->va_af;
+		status = dladm_set_conf_field(handle, conf, FVRAF,
+		    DLADM_TYPE_UINT64, &u64);
+		if (status != DLADM_STATUS_OK)
+			return (status);
+
+		if (attrp->va_mac_len != ETHERADDRL) {
+			u64 = attrp->va_mac_len;
+			status = dladm_set_conf_field(handle, conf, FMADDRLEN,
+			    DLADM_TYPE_UINT64, &u64);
+			if (status != DLADM_STATUS_OK)
+				return (status);
+		}
+
+		if (attrp->va_mac_slot != -1) {
+			u64 = attrp->va_mac_slot;
+			status = dladm_set_conf_field(handle, conf,
+			    FMADDRSLOT, DLADM_TYPE_UINT64, &u64);
+			if (status != DLADM_STATUS_OK)
+				return (status);
+		}
+
+		if (attrp->va_mac_prefix_len !=
+		    sizeof (dladm_vnic_def_prefix)) {
+			u64 = attrp->va_mac_prefix_len;
+			status = dladm_set_conf_field(handle, conf,
+			    FMADDRPREFIXLEN, DLADM_TYPE_UINT64, &u64);
+			if (status != DLADM_STATUS_OK)
+				return (status);
+		}
+
+		(void) dladm_vnic_macaddr2str(attrp->va_mac_addr, macstr);
+		status = dladm_set_conf_field(handle, conf, FMACADDR,
+		    DLADM_TYPE_STR, macstr);
+		if (status != DLADM_STATUS_OK)
+			return (status);
+	}
+
+	if (attrp->va_vid != VLAN_ID_NONE) {
+		u64 = attrp->va_vid;
+		status = dladm_set_conf_field(handle, conf, FVLANID,
+		    DLADM_TYPE_UINT64, &u64);
+		if (status != DLADM_STATUS_OK)
+			return (status);
+	}
+
+	return (DLADM_STATUS_OK);
+}
+
 /*
  * Based on the VRRP specification, the virtual router MAC address associated
  * with a virtual router is an IEEE 802 MAC address in the following format:
@@ -393,31 +457,23 @@ i_dladm_vnic_vrrp_mac(vrid_t vrid, int af, uint8_t *mac, uint_t maclen)
 }
 
 /*
- * Create a new VNIC / VLAN. Update the configuration file and bring it up.
+ * Perform all the heavy lifting involved with creating a new VNIC / VLAN.
+ * Update the configuration file and bring it up.
+ *
  * The "vrid" and "af" arguments are only required if the mac_addr_type is
  * VNIC_MAC_ADDR_TYPE_VRID. In that case, the MAC address will be caculated
- * based on the above algorithm.
+ * by i_dladm_vnic_vrrp_mac() above.
  */
-dladm_status_t
-dladm_vnic_create(dladm_handle_t handle, const char *vnic, datalink_id_t linkid,
-    vnic_mac_addr_type_t mac_addr_type, uchar_t *mac_addr, uint_t mac_len,
-    int *mac_slot, uint_t mac_prefix_len, uint16_t vid, vrid_t vrid,
-    int af, datalink_id_t *vnic_id_out, dladm_arg_list_t *proplist,
-    dladm_errlist_t *errs, uint32_t flags)
+static dladm_status_t
+i_dladm_vnic_common(dladm_handle_t handle, int cmd, dladm_vnic_attr_t *attrp,
+    uint32_t class, dladm_arg_list_t *proplist, dladm_errlist_t *errs,
+    uint32_t flags, uint32_t *pclassp, dladm_conf_t conf)
 {
-	dladm_vnic_attr_t attr;
-	datalink_id_t vnic_id;
-	datalink_class_t class, pclass;
+	datalink_class_t pclass;
 	uint32_t media = DL_ETHER;
 	uint32_t link_flags;
-	char name[MAXLINKNAMELEN];
-	uchar_t tmp_addr[MAXMACADDRLEN];
 	dladm_status_t status;
-	boolean_t is_vlan;
 	boolean_t is_etherstub;
-	uint_t i;
-	boolean_t vnic_created = B_FALSE;
-	boolean_t conf_set = B_FALSE;
 
 	/*
 	 * Sanity test arguments.
@@ -425,26 +481,13 @@ dladm_vnic_create(dladm_handle_t handle, const char *vnic, datalink_id_t linkid,
 	if ((flags & DLADM_OPT_ACTIVE) == 0)
 		return (DLADM_STATUS_NOTSUP);
 
+	is_etherstub = (flags & DLADM_OPT_ANCHOR) != 0;
+
 	/*
-	 * It's an anchor VNIC - linkid must be set to DATALINK_INVALID_LINKID
-	 * and the VLAN id must be 0
+	 * Make sure the link_id is sensible if it was given.
 	 */
-	if ((flags & DLADM_OPT_ANCHOR) != 0 &&
-	    (linkid != DATALINK_INVALID_LINKID || vid != 0)) {
-		return (DLADM_STATUS_BADARG);
-	}
-
-	is_vlan = ((flags & DLADM_OPT_VLAN) != 0);
-	if (is_vlan && ((vid < 1 || vid > 4094)))
-		return (DLADM_STATUS_VIDINVAL);
-
-	is_etherstub = (linkid == DATALINK_INVALID_LINKID);
-
-	if (!dladm_vnic_macaddrtype2str(mac_addr_type))
-		return (DLADM_STATUS_INVALIDMACADDRTYPE);
-
-	if (!is_etherstub) {
-		if ((status = dladm_datalink_id2info(handle, linkid,
+	if (attrp->va_link_id != DATALINK_INVALID_LINKID) {
+		if ((status = dladm_datalink_id2info(handle, attrp->va_link_id,
 		    &link_flags, &pclass, &media, NULL, 0)) != DLADM_STATUS_OK)
 			return (status);
 
@@ -457,13 +500,16 @@ dladm_vnic_create(dladm_handle_t handle, const char *vnic, datalink_id_t linkid,
 		if (pclass == DATALINK_CLASS_VNIC ||
 		    pclass == DATALINK_CLASS_VLAN)
 			return (DLADM_STATUS_BADARG);
+
+		if (pclassp != NULL)
+			*pclassp = pclass;
 	}
 
 	/*
 	 * Only VRRP VNIC need VRID and address family specified.
 	 */
-	if (mac_addr_type != VNIC_MAC_ADDR_TYPE_VRID &&
-	    (af != AF_UNSPEC || vrid != VRRP_VRID_NONE)) {
+	if (attrp->va_mac_addr_type != VNIC_MAC_ADDR_TYPE_VRID &&
+	    (attrp->va_af != AF_UNSPEC || attrp->va_vrid != VRRP_VRID_NONE)) {
 		return (DLADM_STATUS_BADARG);
 	}
 
@@ -472,38 +518,136 @@ dladm_vnic_create(dladm_handle_t handle, const char *vnic, datalink_id_t linkid,
 	 * was specified by the caller, use the default MAC address
 	 * prefix.
 	 */
-	if ((mac_addr_type == VNIC_MAC_ADDR_TYPE_RANDOM ||
-	    mac_addr_type == VNIC_MAC_ADDR_TYPE_AUTO) &&
-	    mac_prefix_len == 0) {
-		mac_prefix_len = sizeof (dladm_vnic_def_prefix);
-		mac_addr = tmp_addr;
-		bcopy(dladm_vnic_def_prefix, mac_addr, mac_prefix_len);
+	if ((attrp->va_mac_addr_type == VNIC_MAC_ADDR_TYPE_RANDOM ||
+	    attrp->va_mac_addr_type == VNIC_MAC_ADDR_TYPE_AUTO) &&
+	    attrp->va_mac_prefix_len == 0) {
+		attrp->va_mac_prefix_len = sizeof (dladm_vnic_def_prefix);
+		bcopy(dladm_vnic_def_prefix, attrp->va_mac_addr,
+		    attrp->va_mac_prefix_len);
 	}
 
 	/*
 	 * If this is a VRRP VNIC, generate its MAC address using the given
 	 * VRID and address family.
 	 */
-	if (mac_addr_type == VNIC_MAC_ADDR_TYPE_VRID) {
+	if (attrp->va_mac_addr_type == VNIC_MAC_ADDR_TYPE_VRID) {
 		/*
 		 * VRRP VNICs must be created over ethernet data-links.
 		 */
-		if (vrid < VRRP_VRID_MIN || vrid > VRRP_VRID_MAX ||
-		    (af != AF_INET && af != AF_INET6) || mac_addr != NULL ||
-		    mac_len != 0 || mac_prefix_len != 0 ||
-		    (mac_slot != NULL && *mac_slot != -1) || is_etherstub ||
-		    media != DL_ETHER) {
+		if (attrp->va_vrid < VRRP_VRID_MIN ||
+		    attrp->va_vrid > VRRP_VRID_MAX ||
+		    (attrp->va_af != AF_INET && attrp->va_af != AF_INET6) ||
+		    attrp->va_mac_len != 0 || attrp->va_mac_prefix_len != 0 ||
+		    attrp->va_mac_slot != -1 ||
+		    is_etherstub || media != DL_ETHER) {
 			return (DLADM_STATUS_BADARG);
 		}
-		mac_len = ETHERADDRL;
-		mac_addr = tmp_addr;
-		status = i_dladm_vnic_vrrp_mac(vrid, af, mac_addr, mac_len);
+		attrp->va_mac_len = ETHERADDRL;
+		status = i_dladm_vnic_vrrp_mac(attrp->va_vrid, attrp->va_af,
+		    attrp->va_mac_addr, attrp->va_mac_len);
 		if (status != DLADM_STATUS_OK)
 			return (status);
 	}
 
-	if (mac_len > MAXMACADDRLEN)
+	if (attrp->va_mac_len > MAXMACADDRLEN)
 		return (DLADM_STATUS_INVALIDMACADDRLEN);
+
+	/* Extract resource_ctl and cpu_list from proplist */
+	if (proplist != NULL) {
+		status = dladm_link_proplist_extract(handle, proplist,
+		    &attrp->va_resource_props, 0);
+		if (status != DLADM_STATUS_OK)
+			return (status);
+	}
+
+	attrp->va_force = (flags & DLADM_OPT_FORCE) != 0;
+
+	status = i_dladm_vnic_ioctl(handle, cmd, attrp, is_etherstub);
+	if (status != DLADM_STATUS_OK)
+		return (status);
+
+	/* Save vnic configuration and its properties */
+	if (!(flags & DLADM_OPT_PERSIST))
+		return (status);
+
+	/*
+	 * If anything fails here, we must cleanup the vnic we've created,
+	 */
+
+	status = i_dladm_vnic_attr2conf(handle, attrp, conf, class);
+	if (status != DLADM_STATUS_OK)
+		goto out;
+
+	status = dladm_write_conf(handle, conf);
+	if (status != DLADM_STATUS_OK)
+		goto out;
+
+	if (proplist == NULL)
+		return (DLADM_STATUS_OK);
+
+	for (int i = 0; i < proplist->al_count; i++) {
+		dladm_arg_info_t *aip = &proplist->al_info[i];
+
+		status = dladm_set_linkprop(handle, attrp->va_vnic_id,
+		    aip->ai_name, aip->ai_val, aip->ai_count,
+		    DLADM_OPT_PERSIST);
+		if (status != DLADM_STATUS_OK) {
+			char	errmsg[DLADM_STRSIZE];
+
+			(void) dladm_errlist_append(errs,
+			    "failed to set property %s: %s",
+			    aip->ai_name, dladm_status2str(status, errmsg));
+
+			goto out;
+		}
+	}
+
+out:
+	if (status != DLADM_STATUS_OK) {
+		(void) i_dladm_vnic_delete_sys(handle, attrp->va_vnic_id);
+		(void) dladm_destroy_datalink_id(handle, attrp->va_vnic_id,
+		    flags);
+	}
+
+	return (status);
+}
+
+/*
+ * Create a new VNIC / VLAN.
+ */
+dladm_status_t
+dladm_vnic_create(dladm_handle_t handle, const char *vnic,
+    dladm_vnic_attr_t *attrp, dladm_arg_list_t *proplist,
+    dladm_errlist_t *errs, uint32_t flags)
+{
+	dladm_conf_t conf = { 0 };
+	char name[MAXLINKNAMELEN];
+	datalink_class_t class, pclass;
+	dladm_status_t status;
+	boolean_t is_vlan;
+	boolean_t is_etherstub;
+	boolean_t vnic_created = B_FALSE;
+	boolean_t conf_created = B_FALSE;
+
+	/*
+	 * If it is an anchor VNIC, va_link_id must be set to
+	 * DATALINK_INVALID_LINKID and the VLAN id must be 0.
+	 */
+	if ((flags & DLADM_OPT_ANCHOR) != 0 &&
+	    (attrp->va_link_id != DATALINK_INVALID_LINKID ||
+	    attrp->va_vid != VLAN_ID_UNTAGGED)) {
+		return (DLADM_STATUS_BADARG);
+	}
+
+	is_vlan = ((flags & DLADM_OPT_VLAN) != 0);
+	if ((attrp->va_vid < VLAN_ID_MIN || attrp->va_vid > VLAN_ID_MAX) &&
+	    (is_vlan || attrp->va_vid != VLAN_ID_UNTAGGED))
+		return (DLADM_STATUS_VIDINVAL);
+
+	is_etherstub = (flags & DLADM_OPT_ANCHOR) != 0;
+
+	if (dladm_vnic_macaddrtype2str(attrp->va_mac_addr_type) == NULL)
+		return (DLADM_STATUS_INVALIDMACADDRTYPE);
 
 	if (vnic == NULL) {
 		flags |= DLADM_OPT_PREFIX;
@@ -514,46 +658,33 @@ dladm_vnic_create(dladm_handle_t handle, const char *vnic, datalink_id_t linkid,
 
 	class = is_vlan ? DATALINK_CLASS_VLAN :
 	    (is_etherstub ? DATALINK_CLASS_ETHERSTUB : DATALINK_CLASS_VNIC);
-	if ((status = dladm_create_datalink_id(handle, name, class,
-	    media, flags, &vnic_id)) != DLADM_STATUS_OK)
+	status = dladm_create_datalink_id(handle, name, class, DL_ETHER, flags,
+	    &attrp->va_vnic_id);
+	if (status != DLADM_STATUS_OK)
 		return (status);
 
 	if ((flags & DLADM_OPT_PREFIX) != 0) {
-		(void) snprintf(name + 4, sizeof (name), "%llu", vnic_id);
+		(void) snprintf(name + 4, sizeof (name), "%llu",
+		    attrp->va_vnic_id);
 		flags &= ~DLADM_OPT_PREFIX;
 	}
 
-	bzero(&attr, sizeof (attr));
-
-	/* Extract resource_ctl and cpu_list from proplist */
-	if (proplist != NULL) {
-		status = dladm_link_proplist_extract(handle, proplist,
-		    &attr.va_resource_props, 0);
+	/* Save vnic configuration and its properties */
+	if ((flags & DLADM_OPT_PERSIST) != 0) {
+		status = dladm_create_conf(handle, name, attrp->va_vnic_id,
+		    class, DL_ETHER, &conf);
 		if (status != DLADM_STATUS_OK)
 			goto done;
+		conf_created = B_TRUE;
 	}
 
-	attr.va_vnic_id = vnic_id;
-	attr.va_link_id = linkid;
-	attr.va_mac_addr_type = mac_addr_type;
-	attr.va_mac_len = mac_len;
-	if (mac_slot != NULL)
-		attr.va_mac_slot = *mac_slot;
-	if (mac_len > 0)
-		bcopy(mac_addr, attr.va_mac_addr, mac_len);
-	else if (mac_prefix_len > 0)
-		bcopy(mac_addr, attr.va_mac_addr, mac_prefix_len);
-	attr.va_mac_prefix_len = mac_prefix_len;
-	attr.va_vid = vid;
-	attr.va_vrid = vrid;
-	attr.va_af = af;
-	attr.va_force = (flags & DLADM_OPT_FORCE) != 0;
-
-	status = i_dladm_vnic_create_sys(handle, &attr);
+	status = i_dladm_vnic_common(handle, VNIC_IOC_CREATE, attrp, class,
+	    proplist, errs, flags, &pclass, conf);
 	if (status != DLADM_STATUS_OK) {
 		if (!is_etherstub && pclass == DATALINK_CLASS_OVERLAY &&
 		    status == DLADM_STATUS_ADDRNOTAVAIL) {
 			char errmsg[DLADM_STRSIZE];
+
 			(void) dladm_errlist_append(errs,
 			    "failed to start overlay device; "
 			    "could not open underlay socket: %s",
@@ -563,51 +694,26 @@ dladm_vnic_create(dladm_handle_t handle, const char *vnic, datalink_id_t linkid,
 	}
 	vnic_created = B_TRUE;
 
-	/* Save vnic configuration and its properties */
-	if (!(flags & DLADM_OPT_PERSIST))
-		goto done;
-
-	status = dladm_vnic_persist_conf(handle, name, &attr, class);
-	if (status != DLADM_STATUS_OK)
-		goto done;
-	conf_set = B_TRUE;
-
-	if (proplist != NULL) {
-		for (i = 0; i < proplist->al_count; i++) {
-			dladm_arg_info_t	*aip = &proplist->al_info[i];
-
-			status = dladm_set_linkprop(handle, vnic_id,
-			    aip->ai_name, aip->ai_val, aip->ai_count,
-			    DLADM_OPT_PERSIST);
-			if (status != DLADM_STATUS_OK) {
-				char	errmsg[DLADM_STRSIZE];
-				(void) dladm_errlist_append(errs,
-				    "failed to set property %s: %s",
-				    aip->ai_name,
-				    dladm_status2str(status, errmsg));
-				break;
-			}
-		}
-	}
 
 done:
+	if (conf_created)
+		dladm_destroy_conf(handle, conf);
+
 	if (status != DLADM_STATUS_OK) {
-		if (conf_set)
-			(void) dladm_remove_conf(handle, vnic_id);
+		if (conf_created)
+			(void) dladm_remove_conf(handle, attrp->va_vnic_id);
+
 		if (vnic_created)
-			(void) i_dladm_vnic_delete_sys(handle, vnic_id);
-		(void) dladm_destroy_datalink_id(handle, vnic_id, flags);
-	} else {
-		if (vnic_id_out != NULL)
-			*vnic_id_out = vnic_id;
-		if (mac_slot != NULL)
-			*mac_slot = attr.va_mac_slot;
+			(void) i_dladm_vnic_delete_sys(handle,
+			    attrp->va_vnic_id);
+		(void) dladm_destroy_datalink_id(handle, attrp->va_vnic_id,
+		    flags);
 	}
 
 	if (is_vlan) {
 		dladm_status_t stat2;
 
-		stat2 = dladm_bridge_refresh(handle, linkid);
+		stat2 = dladm_bridge_refresh(handle, attrp->va_link_id);
 		if (status == DLADM_STATUS_OK && stat2 != DLADM_STATUS_OK)
 			status = stat2;
 	}
@@ -689,113 +795,21 @@ dladm_vnic_str2macaddr(const char *str, uchar_t *buf)
 	return (DLADM_STATUS_OK);
 }
 
-
-static dladm_status_t
-dladm_vnic_persist_conf(dladm_handle_t handle, const char *name,
-    dladm_vnic_attr_t *attrp, datalink_class_t class)
-{
-	dladm_conf_t conf;
-	dladm_status_t status;
-	char macstr[ETHERADDRL * 3];
-	char linkover[MAXLINKNAMELEN];
-	uint64_t u64;
-
-	if ((status = dladm_create_conf(handle, name, attrp->va_vnic_id,
-	    class, DL_ETHER, &conf)) != DLADM_STATUS_OK)
-		return (status);
-
-	if (attrp->va_link_id != DATALINK_INVALID_LINKID) {
-		status = dladm_datalink_id2info(handle, attrp->va_link_id, NULL,
-		    NULL, NULL, linkover, sizeof (linkover));
-		if (status != DLADM_STATUS_OK)
-			goto done;
-		status = dladm_set_conf_field(handle, conf, FLINKOVER,
-		    DLADM_TYPE_STR, linkover);
-		if (status != DLADM_STATUS_OK)
-			goto done;
-	}
-
-	if (class != DATALINK_CLASS_VLAN) {
-		u64 = attrp->va_mac_addr_type;
-		status = dladm_set_conf_field(handle, conf, FMADDRTYPE,
-		    DLADM_TYPE_UINT64, &u64);
-		if (status != DLADM_STATUS_OK)
-			goto done;
-
-		u64 = attrp->va_vrid;
-		status = dladm_set_conf_field(handle, conf, FVRID,
-		    DLADM_TYPE_UINT64, &u64);
-		if (status != DLADM_STATUS_OK)
-			goto done;
-
-		u64 = attrp->va_af;
-		status = dladm_set_conf_field(handle, conf, FVRAF,
-		    DLADM_TYPE_UINT64, &u64);
-		if (status != DLADM_STATUS_OK)
-			goto done;
-
-		if (attrp->va_mac_len != ETHERADDRL) {
-			u64 = attrp->va_mac_len;
-			status = dladm_set_conf_field(handle, conf, FMADDRLEN,
-			    DLADM_TYPE_UINT64, &u64);
-			if (status != DLADM_STATUS_OK)
-				goto done;
-		}
-
-		if (attrp->va_mac_slot != -1) {
-			u64 = attrp->va_mac_slot;
-			status = dladm_set_conf_field(handle, conf,
-			    FMADDRSLOT, DLADM_TYPE_UINT64, &u64);
-			if (status != DLADM_STATUS_OK)
-			goto done;
-		}
-
-		if (attrp->va_mac_prefix_len !=
-		    sizeof (dladm_vnic_def_prefix)) {
-			u64 = attrp->va_mac_prefix_len;
-			status = dladm_set_conf_field(handle, conf,
-			    FMADDRPREFIXLEN, DLADM_TYPE_UINT64, &u64);
-			if (status != DLADM_STATUS_OK)
-				goto done;
-		}
-
-		(void) dladm_vnic_macaddr2str(attrp->va_mac_addr, macstr);
-		status = dladm_set_conf_field(handle, conf, FMACADDR,
-		    DLADM_TYPE_STR, macstr);
-		if (status != DLADM_STATUS_OK)
-			goto done;
-	}
-
-	if (attrp->va_vid != 0) {
-		u64 = attrp->va_vid;
-		status = dladm_set_conf_field(handle, conf, FVLANID,
-		    DLADM_TYPE_UINT64, &u64);
-		if (status != DLADM_STATUS_OK)
-			goto done;
-	}
-
-	/*
-	 * Commit the link configuration.
-	 */
-	status = dladm_write_conf(handle, conf);
-
-done:
-	dladm_destroy_conf(handle, conf);
-	return (status);
-}
-
 typedef struct dladm_vnic_up_arg_s {
-	uint32_t	flags;
-	dladm_status_t	status;
+	datalink_class_t vua_class;
+	dladm_status_t vua_status;
 } dladm_vnic_up_arg_t;
 
 static int
 i_dladm_vnic_up(dladm_handle_t handle, datalink_id_t linkid, void *arg)
 {
-	dladm_status_t *statusp = &(((dladm_vnic_up_arg_t *)arg)->status);
+	dladm_vnic_up_arg_t *vua = arg;
 	dladm_vnic_attr_t attr;
 	dladm_status_t status;
 	dladm_arg_list_t *proplist;
+	boolean_t is_etherstub;
+
+	is_etherstub = (vua->vua_class == DATALINK_CLASS_ETHERSTUB);
 
 	bzero(&attr, sizeof (attr));
 
@@ -813,7 +827,8 @@ i_dladm_vnic_up(dladm_handle_t handle, datalink_id_t linkid, void *arg)
 		    &attr.va_resource_props, DLADM_OPT_BOOT);
 	}
 
-	status = i_dladm_vnic_create_sys(handle, &attr);
+	status = i_dladm_vnic_ioctl(handle, VNIC_IOC_CREATE, &attr,
+	    is_etherstub);
 	if (status == DLADM_STATUS_OK) {
 		status = dladm_up_datalink_id(handle, linkid);
 		if (status != DLADM_STATUS_OK)
@@ -821,26 +836,25 @@ i_dladm_vnic_up(dladm_handle_t handle, datalink_id_t linkid, void *arg)
 	}
 
 done:
-	*statusp = status;
+	vua->vua_status = status;
 	return (DLADM_WALK_CONTINUE);
 }
 
 dladm_status_t
 dladm_vnic_up(dladm_handle_t handle, datalink_id_t linkid, uint32_t flags)
 {
-	dladm_vnic_up_arg_t vnic_arg;
-	datalink_class_t class;
+	dladm_vnic_up_arg_t vua;
 
-	class = ((flags & DLADM_OPT_VLAN) != 0) ? DATALINK_CLASS_VLAN :
+	vua.vua_class = ((flags & DLADM_OPT_VLAN) != 0) ? DATALINK_CLASS_VLAN :
 	    (DATALINK_CLASS_VNIC | DATALINK_CLASS_ETHERSTUB);
+	vua.vua_status = DLADM_STATUS_OK;
 
 	if (linkid == DATALINK_ALL_LINKID) {
-		(void) dladm_walk_datalink_id(i_dladm_vnic_up, handle,
-		    &vnic_arg, class, DATALINK_ANY_MEDIATYPE,
-		    DLADM_OPT_PERSIST);
+		(void) dladm_walk_datalink_id(i_dladm_vnic_up, handle, &vua,
+		    vua.vua_class, DATALINK_ANY_MEDIATYPE, DLADM_OPT_PERSIST);
 		return (DLADM_STATUS_OK);
 	} else {
-		(void) i_dladm_vnic_up(handle, linkid, &vnic_arg);
-		return (vnic_arg.status);
+		(void) i_dladm_vnic_up(handle, linkid, &vua);
+		return (vua.vua_status);
 	}
 }

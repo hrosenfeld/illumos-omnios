@@ -28,6 +28,7 @@
  * Copyright 2021 RackTop Systems, Inc.
  * Copyright 2024, 2026 H. William Welliver <william@welliver.org>
  * Copyright 2024 Oxide Computer Company
+ * Copyright 2026 Hans Rosenfeld
  */
 
 #include <stdio.h>
@@ -70,9 +71,9 @@
 #include <libdloverlay.h>
 #include <libinetutil.h>
 #include <libvrrpadm.h>
+#include <sys/vlan.h>
 #include <bsm/adt.h>
 #include <bsm/adt_event.h>
-#include <libdlvnic.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ib/ib_types.h>
@@ -285,42 +286,99 @@ typedef struct	cmd {
 } cmd_t;
 
 static cmd_t	cmds[] = {
-	{ "help",		do_help,		NULL		},
-	{ "rename-link",	do_rename_link,
-	    "    rename-link      <oldlink> <newlink>"			},
+	{ "help",		do_help,	"    help\n"		},
 	{ "show-link",		do_show_link,
-	    "    show-link        [-pP] [-o <field>,..] [-s [-i <interval>]] "
-	    "[<link>]\n"						},
-	{ "create-aggr",	do_create_aggr,
-	    "    create-aggr      [-t] [-P <policy>] [-L <mode>] [-T <time>] "
-	    "[-u <address>]\n"
-	    "\t\t     -l <link> [-l <link>...] <link>"			},
-	{ "delete-aggr",	do_delete_aggr,
-	    "    delete-aggr      [-t] <link>"				},
-	{ "add-aggr",		do_add_aggr,
-	    "    add-aggr         [-t] -l <link> [-l <link>...] <link>" },
-	{ "remove-aggr",	do_remove_aggr,
-	    "    remove-aggr      [-t] -l <link> [-l <link>...] <link>" },
-	{ "modify-aggr",	do_modify_aggr,
-	    "    modify-aggr      [-t] [-P <policy>] [-L <mode>] [-T <time>] "
-	    "[-u <address>]\n"
-	    "\t\t     <link>"						},
-	{ "show-aggr",		do_show_aggr,
-	    "    show-aggr        [-pPLx] [-o <field>,..] [-s [-i <interval>]] "
-	    "[<link>]\n"						},
+	    "    show-link        [-P] [-s [-i <interval>]] "
+	    "[[-p] -o <field>,..] [<link>]"				},
+	{ "rename-link",	do_rename_link,
+	    "    rename-link      [-R root-dir] <link> <newlink>\n"	},
+	{ "init-phys",		do_init_phys,		NULL		},
+	{ "delete-phys",	do_delete_phys,
+	    "    delete-phys      <phys-link>"				},
+	{ "show-phys",		do_show_phys,
+	    "    show-phys        [-m | -H | -P] [[-p] [-o <field>[,...]] "
+	    "[<phys-link>]\n"						},
 	{ "up-aggr",		do_up_aggr,	NULL			},
+	{ "create-aggr",	do_create_aggr,
+	    "    create-aggr      [-t] [-R root-dir] [-P <policy>] [-L <mode>] "
+	    "[-T <time>]\n"
+	    "\t\t     [-u <address>] -l <ether-link> [-l <ether-link>...]\n"
+	    "\t\t     <aggr-link>"					},
+	{ "modify-aggr",	do_modify_aggr,
+	    "    modify-aggr      [-t] [-R root-dir] [-P <policy>] [-L <mode>] "
+	    "[-T <time>]\n"
+	    "\t\t     [-u <address>] <aggr-link>"			},
+	{ "delete-aggr",	do_delete_aggr,
+	    "    delete-aggr      [-t] [-R root-dir] <aggr-link>"	},
+	{ "add-aggr",		do_add_aggr,
+	    "    add-aggr         [-t] [-R root-dir] -l <ether-link> "
+	    "[-l <ether-link>...]\n"
+	    "\t\t     <aggr-link>"					},
+	{ "remove-aggr",	do_remove_aggr,
+	    "    remove-aggr      [-t] [-R root-dir] -l <ether-link> "
+	    "[-l <ether-link>...]\n"
+	    "\t\t     <aggr-link>"					},
+	{ "show-aggr",		do_show_aggr,
+	    "    show-aggr        [-PLx] [-s [-i <interval>]] "
+	    "[[-p] -o <field>,..] [<aggr-link>]\n"			},
+	{ "create-bridge",	do_create_bridge,
+	    "    create-bridge    [-R <root-dir>] [-P <protect>] "
+	    "[-p <priority>]\n"
+	    "\t\t     [-m <max-age>] [-h <hello-time>] [-d <forward-delay>]\n"
+	    "\t\t     [-f <force-protocol>] [-l <link>]...\n"
+	    "\t\t     <bridge-link>"					},
+	{ "modify-bridge",	do_modify_bridge,
+	    "    modify-bridge    [-R <root-dir>] [-P <protect>] "
+	    "[-p <priority>]\n"
+	    "\t\t     [-m <max-age>] [-h <hello-time>] [-d <forward-delay>]\n"
+	    "\t\t     [-f <force-protocol>] <bridge-link>"		},
+	{ "delete-bridge",	do_delete_bridge,
+	    "    delete-bridge    [-R <root-dir>] <bridge-link>"	},
+	{ "add-bridge",		do_add_bridge,
+	    "    add-bridge       [-R <root-dir>] -l <link> [-l <link>]... "
+	    "<bridge-link>"						},
+	{ "remove-bridge",	do_remove_bridge,
+	    "    remove-bridge    [-R <root-dir>] -l <link> [-l <link>]... "
+	    "<bridge-link>"						},
+	{ "show-bridge",	do_show_bridge,
+	    "    show-bridge      [-f | -l | -t] [-s [-i <interval>]] "
+	    "[[-p] -o <field>,...]\n"
+	    "\t\t     [<bridge-link>]\n"				},
+	{ "up-vlan",		do_up_vlan,		NULL		},
+	{ "create-vlan",	do_create_vlan,
+	    "    create-vlan      [-ft] [-R <root-dir>] -l <ether-link> "
+	    "-v <vlan-id> \n"
+	    "\t\t     [vlan-link]"					},
+	{ "delete-vlan",	do_delete_vlan,
+	    "    delete-vlan      [-t] [-R <root-dir>] <vlan-link>"	},
+	{ "show-vlan",		do_show_vlan,
+	    "    show-vlan        [-P] [[-p] -o <field>,..] [<vlan-link>]\n" },
 	{ "scan-wifi",		do_scan_wifi,
-	    "    scan-wifi        [-p] [-o <field>,...] [<link>]"	},
+	    "    scan-wifi        [[-p] -o <field>,...] [<wifi-link>]"	},
 	{ "connect-wifi",	do_connect_wifi,
 	    "    connect-wifi     [-e <essid>] [-i <bssid>] [-k <key>,...] "
-	    "[-s wep|wpa]\n"
+	    "[-s none|wep|wpa]\n"
 	    "\t\t     [-a open|shared] [-b bss|ibss] [-c] [-m a|b|g] "
 	    "[-T <time>]\n"
-	    "\t\t     [<link>]"						},
+	    "\t\t     [<wifi-link>]"					},
 	{ "disconnect-wifi",	do_disconnect_wifi,
-	    "    disconnect-wifi  [-a] [<link>]"			},
+	    "    disconnect-wifi  [-a] [<wifi-link>]"			},
 	{ "show-wifi",		do_show_wifi,
-	    "    show-wifi        [-p] [-o <field>,...] [<link>]\n"	},
+	    "    show-wifi        [[-p] -o <field>,...] [<wifi-link>]\n"},
+	{ "create-simnet",	do_create_simnet,
+	    "    create-simnet    [-t] [-R <root-dir>] [-m <media-type>]\n"
+	    "\t\t     [-u <address>] <simnet-link>"			},
+	{ "modify-simnet",	do_modify_simnet,
+	    "    modify-simnet    [-t] [-R <root-dir>] [-p <peer>] "
+	    "<simnet-link>"						},
+	{ "delete-simnet",	do_delete_simnet,
+	    "    delete-simnet    [-t] [-R <root-dir>] <simnet-link>"	},
+	{ "show-simnet",	do_show_simnet,
+	    "    show-simnet      [-P] [[-p] -o <field>,...] "
+	    "[<simnet-link>]\n"						},
+	{ "up-simnet",		do_up_simnet,		NULL		},
+	{ "show-ether",		do_show_ether,
+	    "    show-ether       [-x] [[-p] -o <field>,...] <ether-link>\n" },
 	{ "set-linkprop",	do_set_linkprop,
 	    "    set-linkprop     [-t] -p <prop>=<value>[,...] <name>"	},
 	{ "reset-linkprop",	do_reset_linkprop,
@@ -328,108 +386,61 @@ static cmd_t	cmds[] = {
 	{ "show-linkprop",	do_show_linkprop,
 	    "    show-linkprop    [-cP] [-o <field>,...] [-p <prop>,...] "
 	    "<name>\n"							},
-	{ "show-ether",		do_show_ether,
-	    "    show-ether       [-px][-o <field>,...] <link>\n"	},
+	{ "init-linkprop",	do_init_linkprop,	NULL		},
+	{ "init-secobj",	do_init_secobj,		NULL		},
 	{ "create-secobj",	do_create_secobj,
 	    "    create-secobj    [-t] [-f <file>] -c <class> <secobj>"	},
 	{ "delete-secobj",	do_delete_secobj,
 	    "    delete-secobj    [-t] <secobj>[,...]"			},
 	{ "show-secobj",	do_show_secobj,
-	    "    show-secobj      [-pP] [-o <field>,...] [<secobj>,...]\n" },
-	{ "init-linkprop",	do_init_linkprop,	NULL		},
-	{ "init-secobj",	do_init_secobj,		NULL		},
-	{ "create-vlan",	do_create_vlan,
-	    "    create-vlan      [-ft] -l <link> -v <vid> [link]"	},
-	{ "delete-vlan",	do_delete_vlan,
-	    "    delete-vlan      [-t] <link>"				},
-	{ "show-vlan",		do_show_vlan,
-	    "    show-vlan        [-pP] [-o <field>,..] [<link>]\n"	},
-	{ "up-vlan",		do_up_vlan,		NULL		},
-	{ "create-iptun",	do_create_iptun,
-	    "    create-iptun     [-t] -T <type> "
-	    "[-a {local|remote}=<addr>,...] <link>]" },
-	{ "delete-iptun",	do_delete_iptun,
-	    "    delete-iptun     [-t] <link>"				},
-	{ "modify-iptun",	do_modify_iptun,
-	    "    modify-iptun     [-t] -a {local|remote}=<addr>,... <link>" },
-	{ "show-iptun",		do_show_iptun,
-	    "    show-iptun       [-pP] [-o <field>,..] [<link>]\n"	},
+	    "    show-secobj      [-P] [[-p] -o <field>,...] "
+	    "[<secobj>,...]\n"						},
+	{ "show-linkmap",	do_show_linkmap,	NULL		},
+	{ "up-vnic",		do_up_vnic,		NULL		},
+	{ "create-vnic",	do_create_vnic,
+	    "    create-vnic      [-t] [-R <root-dir>] -l <link> [-m <value> | "
+	    "auto |\n"
+	    "\t\t     {factory [-n <slot-id>]} | {random [-r <prefix>]} |\n"
+	    "\t\t     {vrrp -V <vrid> -A {inet | inet6}}] [-v <vlan-id> [-f]]\n"
+	    "\t\t     [-p <prop>=<value>[,...]] <vnic-link>"		},
+	{ "delete-vnic",	do_delete_vnic,
+	    "    delete-vnic      [-t] [-R <root-dir>] <vnic-link>"	},
+	{ "show-vnic",		do_show_vnic,
+	    "    show-vnic        [-P] [[-p] [-o <field>[,...] "
+	    "[-l <link>]\n"
+	    "\t\t     [-s [-i <interval>]] [<vnic-link>]\n"		},
+	{ "create-etherstub",	do_create_etherstub,
+	    "    create-etherstub [-t] [-R <root-dir>] <etherstub>"	},
+	{ "delete-etherstub",	do_delete_etherstub,
+	    "    delete-etherstub [-t] [-R <root-dir>] <etherstub>"	},
+	{ "show-etherstub",	do_show_etherstub,
+	    "    show-etherstub   [-t] [<etherstub>]\n"			},
+	{ "up-part",		do_up_part,		NULL		},
+	{ "create-part",	do_create_part,
+	    "    create-part      [-t] [-R <root-dir>] [-f] -l <link> "
+	    "[-P <pkey>]\n"
+	    "\t\t     <part-link>"					},
+	{ "delete-part",	do_delete_part,
+	    "    delete-part      [-t] [-R <root-dir>] <part-link>"	},
+	{ "show-part",		do_show_part,
+	    "    show-part        [-P] [[-p] -o <field>,...] [-l <linkover>]\n"
+	    "\t\t     [<part-link>]"					},
+	{ "show-ib",		do_show_ib,
+	    "    show-ib          [[-p] -o <field>,...] [<link>]\n"	},
 	{ "up-iptun",		do_up_iptun,		NULL		},
 	{ "down-iptun",		do_down_iptun,		NULL		},
-	{ "delete-phys",	do_delete_phys,
-	    "    delete-phys      <link>"				},
-	{ "show-phys",		do_show_phys,
-	    "    show-phys        [-m | -H | -P] [[-p] [-o <field>[,...]] "
-	    "[<link>]\n"						},
-	{ "init-phys",		do_init_phys,		NULL		},
-	{ "show-linkmap",	do_show_linkmap,	NULL		},
-	{ "create-vnic",	do_create_vnic,
-	    "    create-vnic      [-t] -l <link> [-m <value> | auto |\n"
-	    "\t\t     {factory [-n <slot-id>]} | {random [-r <prefix>]} |\n"
-	    "\t\t     {vrrp -V <vrid> -A {inet | inet6}} [-v <vid> [-f]]\n"
-	    "\t\t     [-p <prop>=<value>[,...]] <vnic-link>"	},
-	{ "delete-vnic",	do_delete_vnic,
-	    "    delete-vnic      [-t] <vnic-link>"			},
-	{ "show-vnic",		do_show_vnic,
-	    "    show-vnic        [-pP] [-l <link>] [-s [-i <interval>]] "
-	    "[<link>]\n"						},
-	{ "up-vnic",		do_up_vnic,		NULL		},
-	{ "create-part",	do_create_part,
-	    "    create-part      [-t] [-f] -l <link> [-P <pkey>]\n"
-	    "\t\t     [-R <root-dir>] <part-link>"			},
-	{ "delete-part",	do_delete_part,
-	    "    delete-part      [-t] [-R <root-dir>] <part-link>"},
-	{ "show-part",		do_show_part,
-	    "    show-part        [-pP] [-o <field>,...][-l <linkover>]\n"
-	    "\t\t     [<part-link>]"		},
-	{ "show-ib",		do_show_ib,
-	    "    show-ib          [-p] [-o <field>,...] [<link>]\n"	},
-	{ "up-part",		do_up_part,		NULL		},
-	{ "create-etherstub",	do_create_etherstub,
-	    "    create-etherstub [-t] <link>"				},
-	{ "delete-etherstub",	do_delete_etherstub,
-	    "    delete-etherstub [-t] <link>"				},
-	{ "show-etherstub",	do_show_etherstub,
-	    "    show-etherstub   [-t] [<link>]\n"			},
-	{ "create-simnet",	do_create_simnet,
-	    "    create-simnet    [-t] [-R <root-dir>] [-m <media-type>]\n"
-	    "\t\t     [-u <address>] <simnet-link>"	},
-	{ "modify-simnet",	do_modify_simnet,
-	    "    modify-simnet    [-t] [-R <root-dir>] [-p <peer>] "
-	    "<simnet-link>"	},
-	{ "delete-simnet",	do_delete_simnet,
-	    "    delete-simnet    [-t] [-R <root-dir>] <simnet-link>"	},
-	{ "show-simnet",	do_show_simnet,
-	    "    show-simnet      [-P] [[-p] -o <field>,...] "
-	    "[<simnet-link>]\n"	},
-	{ "up-simnet",		do_up_simnet,		NULL		},
-	{ "create-bridge",	do_create_bridge,
-	    "    create-bridge    [-R <root-dir>] [-P <protect>] "
-	    "[-p <priority>]\n"
-	    "\t\t     [-m <max-age>] [-h <hello-time>] [-d <forward-delay>]\n"
-	    "\t\t     [-f <force-protocol>] [-l <link>]... <bridge>"	},
-	{ "modify-bridge",	do_modify_bridge,
-	    "    modify-bridge    [-R <root-dir>] [-P <protect>] "
-	    "[-p <priority>]\n"
-	    "\t\t     [-m <max-age>] [-h <hello-time>] [-d <forward-delay>]\n"
-	    "\t\t     [-f <force-protocol>] <bridge>"			},
-	{ "delete-bridge",	do_delete_bridge,
-	    "    delete-bridge    [-R <root-dir>] <bridge>"		},
-	{ "add-bridge",		do_add_bridge,
-	    "    add-bridge       [-R <root-dir>] -l <link> [-l <link>]... "
-	    "<bridge>"							},
-	{ "remove-bridge",	do_remove_bridge,
-	    "    remove-bridge    [-R <root-dir>] -l <link> [-l <link>]... "
-	    "<bridge>"							},
-	{ "show-bridge",	do_show_bridge,
-	    "    show-bridge      [-p] [-o <field>,...] [-s [-i <interval>]] "
-	    "[<bridge>]\n"
-	    "    show-bridge      -l [-p] [-o <field>,...] [-s [-i <interval>]]"
-	    " <bridge>\n"
-	    "    show-bridge      -f [-p] [-o <field>,...] [-s [-i <interval>]]"
-	    " <bridge>\n"
-	    "    show-bridge      -t [-p] [-o <field>,...] [-s [-i <interval>]]"
-	    " <bridge>\n"						},
+	{ "create-iptun",	do_create_iptun,
+	    "    create-iptun     [-t] [-R <root-dir>] -T <type>\n"
+	    "\t\t     [-a {local|remote}=<addr>,...] <iptun-link>]"	},
+	{ "modify-iptun",	do_modify_iptun,
+	    "    modify-iptun     [-t] [-R <root-dir>] "
+	    "-a {local|remote}=<addr>,...\n"
+	    "\t\t     <iptun-link>"					},
+	{ "delete-iptun",	do_delete_iptun,
+	    "    delete-iptun     [-t] [-R <root-dir> <iptun-link>"	},
+	{ "show-iptun",		do_show_iptun,
+	    "    show-iptun       [-P] [[-p] -o <field>,..] [<iptun-link>]\n" },
+	{ "up-overlay",		do_up_overlay,		NULL		},
 	{ "create-overlay",	do_create_overlay,
 	    "    create-overlay   [-t] -e <encap> -s <search> -v <vnetid>\n"
 	    "\t\t     [ -p <prop>=<value>[,...]] <overlay>"	},
@@ -441,7 +452,6 @@ static cmd_t	cmds[] = {
 	{ "show-overlay",	do_show_overlay,
 	    "    show-overlay     [-f | -t] [[-p] -o <field>,...] "
 	    "[<overlay>]\n"						},
-	{ "up-overlay",		do_up_overlay,		NULL		},
 	{ "show-usage",		do_show_usage,
 	    "    show-usage       [-a] [-d | -F <format>] "
 	    "[-s <DD/MM/YYYY,HH:MM:SS>]\n"
@@ -1051,7 +1061,7 @@ typedef struct vnic_fields_buf_s
 	char vnic_speed[10];
 	char vnic_macaddr[18];
 	char vnic_macaddrtype[19];
-	char vnic_vid[6];
+	char vnic_vid[9];
 	char vnic_zone[ZONENAME_MAX];
 } vnic_fields_buf_t;
 
@@ -2502,7 +2512,8 @@ do_create_vlan(int argc, char *argv[], const char *use)
 			if (vid != 0)
 				die_optdup(option);
 
-			if (!str2int(optarg, &vid) || vid < 1 || vid > 4094)
+			if (!str2int(optarg, &vid) ||
+			    vid < VLAN_ID_MIN || vid > VLAN_ID_MAX)
 				die("invalid VLAN identifier '%s'", optarg);
 
 			break;
@@ -4764,29 +4775,32 @@ do_show_vlan(int argc, char *argv[], const char *use)
 }
 
 static void
-do_create_vnic(int argc, char *argv[], const char *use)
+do_common_vnic(int argc, char *argv[], const char *use,
+    void (*func)(const char *, const char *, dladm_vnic_attr_t *,
+    dladm_arg_list_t *, uint32_t))
 {
-	datalink_id_t		linkid, dev_linkid;
-	char			devname[MAXLINKNAMELEN];
-	char			name[MAXLINKNAMELEN];
-	boolean_t		l_arg = B_FALSE;
 	uint32_t		flags = DLADM_OPT_ACTIVE | DLADM_OPT_PERSIST;
 	char			*altroot = NULL;
-	int			option;
-	char			*endp = NULL;
-	dladm_status_t		status;
-	vnic_mac_addr_type_t	mac_addr_type = VNIC_MAC_ADDR_TYPE_UNKNOWN;
+	const char		*errstr = NULL;
 	uchar_t			*mac_addr = NULL;
-	int			mac_slot = -1;
-	uint_t			maclen = 0, mac_prefix_len = 0;
-	char			propstr[DLADM_STRSIZE];
 	dladm_arg_list_t	*proplist = NULL;
-	int			vid = 0;
-	int			af = AF_UNSPEC;
-	vrid_t			vrid = VRRP_VRID_NONE;
+	dladm_vnic_attr_t	attr;
+	dladm_status_t		status;
+	char			propstr[DLADM_STRSIZE];
+	char			devname[MAXLINKNAMELEN];
+	char			name[MAXLINKNAMELEN];
+	int			option;
 
 	opterr = 0;
 	bzero(propstr, DLADM_STRSIZE);
+	bzero(&attr, sizeof (attr));
+
+	attr.va_link_id = DATALINK_INVALID_LINKID;
+	attr.va_mac_addr_type = VNIC_MAC_ADDR_TYPE_UNKNOWN;
+	attr.va_mac_slot = -1;
+	attr.va_vid = VLAN_ID_NONE;
+	attr.va_vrid = VRRP_VRID_NONE;
+	attr.va_af = AF_UNSPEC;
 
 	while ((option = getopt_long(argc, argv, ":tfR:l:m:n:p:r:v:V:A:H",
 	    vnic_lopts, NULL)) != -1) {
@@ -4801,11 +4815,15 @@ do_create_vnic(int argc, char *argv[], const char *use)
 			if (strlcpy(devname, optarg, MAXLINKNAMELEN) >=
 			    MAXLINKNAMELEN)
 				die("link name too long");
-			l_arg = B_TRUE;
+
+			status = dladm_name2info(handle, devname,
+			    &attr.va_link_id, NULL, NULL, NULL);
+			if (status != DLADM_STATUS_OK)
+				die("invalid link name '%s'", devname);
 			break;
 		case 'm':
-			if (mac_addr_type != VNIC_MAC_ADDR_TYPE_UNKNOWN)
-				die("cannot specify -m option twice");
+			if (attr.va_mac_addr_type != VNIC_MAC_ADDR_TYPE_UNKNOWN)
+				die_optdup(option);
 
 			if (strcmp(optarg, "fixed") == 0) {
 				/*
@@ -4814,13 +4832,16 @@ do_create_vnic(int argc, char *argv[], const char *use)
 				 */
 				die("'fixed' is not a valid MAC address");
 			}
-			if (dladm_vnic_str2macaddrtype(optarg,
-			    &mac_addr_type) != DLADM_STATUS_OK) {
-				mac_addr_type = VNIC_MAC_ADDR_TYPE_FIXED;
+
+			status = dladm_vnic_str2macaddrtype(optarg,
+			    &attr.va_mac_addr_type);
+			if (status != DLADM_STATUS_OK) {
+				attr.va_mac_addr_type =
+				    VNIC_MAC_ADDR_TYPE_FIXED;
 				/* MAC address specified by value */
-				mac_addr = _link_aton(optarg, (int *)&maclen);
+				mac_addr = _link_aton(optarg, &attr.va_mac_len);
 				if (mac_addr == NULL) {
-					if (maclen == (uint_t)-1)
+					if (attr.va_mac_len == -1)
 						die("invalid MAC address");
 					else
 						die("out of memory");
@@ -4828,10 +4849,18 @@ do_create_vnic(int argc, char *argv[], const char *use)
 			}
 			break;
 		case 'n':
-			errno = 0;
-			mac_slot = (int)strtol(optarg, &endp, 10);
-			if (errno != 0 || *endp != '\0')
-				die("invalid slot number");
+			/*
+			 * The number 255 for the maxmimum allowed value for
+			 * mac-slotis has been a completely arbitraty choice.
+			 *
+			 * The only real NIC we support that has factory MACs
+			 * (nxge) has 16 slots. Should we ever support any other
+			 * NIC with more than 255 slots, this must be changed.
+			 */
+			attr.va_mac_slot = strtonum(optarg, 0, 255, &errstr);
+			if (errstr != NULL)
+				die("invalid slot number '%s': %s", optarg,
+				    errstr);
 			break;
 		case 'p':
 			(void) strlcat(propstr, optarg, DLADM_STRSIZE);
@@ -4840,36 +4869,43 @@ do_create_vnic(int argc, char *argv[], const char *use)
 				die("property list too long '%s'", propstr);
 			break;
 		case 'r':
-			mac_addr = _link_aton(optarg, (int *)&mac_prefix_len);
+			mac_addr = _link_aton(optarg, &attr.va_mac_prefix_len);
 			if (mac_addr == NULL) {
-				if (mac_prefix_len == (uint_t)-1)
+				if (attr.va_mac_prefix_len == -1)
 					die("invalid MAC address");
 				else
 					die("out of memory");
 			}
 			break;
 		case 'V':
-			if (!str2int(optarg, (int *)&vrid) ||
-			    vrid < VRRP_VRID_MIN || vrid > VRRP_VRID_MAX) {
-				die("invalid VRRP identifier '%s'", optarg);
-			}
-
+			attr.va_vrid = strtonum(optarg, VRRP_VRID_MIN,
+			    VRRP_VRID_MAX, &errstr);
+			if (errstr != NULL)
+				die("invalid VRRP identifier '%s': %s", optarg,
+				    errstr);
 			break;
 		case 'A':
 			if (strcmp(optarg, "inet") == 0)
-				af = AF_INET;
+				attr.va_af = AF_INET;
 			else if (strcmp(optarg, "inet6") == 0)
-				af = AF_INET6;
+				attr.va_af = AF_INET6;
 			else
 				die("invalid address family '%s'", optarg);
 			break;
 		case 'v':
-			if (vid != 0)
+			if (attr.va_vid != VLAN_ID_NONE)
 				die_optdup(option);
 
-			if (!str2int(optarg, &vid) || vid < 1 || vid > 4094)
-				die("invalid VLAN identifier '%s'", optarg);
-
+			if (strcmp(optarg, "untagged") == 0) {
+				attr.va_vid = VLAN_ID_UNTAGGED;
+			} else {
+				attr.va_vid = strtonum(optarg, VLAN_ID_MIN,
+				    VLAN_ID_MAX, &errstr);
+				if (errstr != NULL) {
+					die("invalid VLAN identifier '%s': %s",
+					    optarg, errstr);
+				}
+			}
 			break;
 		case 'f':
 			flags |= DLADM_OPT_FORCE;
@@ -4879,34 +4915,31 @@ do_create_vnic(int argc, char *argv[], const char *use)
 		}
 	}
 
-	if (mac_addr_type == VNIC_MAC_ADDR_TYPE_UNKNOWN)
-		mac_addr_type = VNIC_MAC_ADDR_TYPE_AUTO;
-
 	/*
 	 * 'f' - force, flag can be specified only with 'v' - vlan.
 	 */
-	if ((flags & DLADM_OPT_FORCE) != 0 && vid == 0)
+	if ((flags & DLADM_OPT_FORCE) != 0 && attr.va_vid == VLAN_ID_NONE)
 		die("-f option can only be used with -v");
 
-	if (mac_prefix_len != 0 && mac_addr_type != VNIC_MAC_ADDR_TYPE_RANDOM &&
-	    mac_addr_type != VNIC_MAC_ADDR_TYPE_FIXED)
+	if (attr.va_mac_prefix_len != 0 &&
+	    attr.va_mac_addr_type != VNIC_MAC_ADDR_TYPE_RANDOM &&
+	    attr.va_mac_addr_type != VNIC_MAC_ADDR_TYPE_FIXED)
 		usage();
 
-	if (mac_addr_type == VNIC_MAC_ADDR_TYPE_VRID) {
-		if (vrid == VRRP_VRID_NONE || af == AF_UNSPEC ||
-		    mac_addr != NULL || maclen != 0 || mac_slot != -1 ||
-		    mac_prefix_len != 0) {
+	if (attr.va_mac_addr_type == VNIC_MAC_ADDR_TYPE_VRID) {
+		if (attr.va_vrid == VRRP_VRID_NONE || attr.va_af == AF_UNSPEC ||
+		    mac_addr != NULL || attr.va_mac_len != 0 ||
+		    attr.va_mac_slot != -1 ||
+		    attr.va_mac_prefix_len != 0) {
 			usage();
 		}
-	} else if ((af != AF_UNSPEC || vrid != VRRP_VRID_NONE)) {
+	} else if ((attr.va_af != AF_UNSPEC ||
+	    attr.va_vrid != VRRP_VRID_NONE)) {
 		usage();
 	}
 
-	/* check required options */
-	if (!l_arg)
-		usage();
-
-	if (mac_slot != -1 && mac_addr_type != VNIC_MAC_ADDR_TYPE_FACTORY)
+	if (attr.va_mac_slot != -1 &&
+	    attr.va_mac_addr_type != VNIC_MAC_ADDR_TYPE_FACTORY)
 		usage();
 
 	/* the VNIC id is the required operand */
@@ -4922,17 +4955,38 @@ do_create_vnic(int argc, char *argv[], const char *use)
 	if (altroot != NULL)
 		altroot_cmd(altroot, argc, argv);
 
-	if (dladm_name2info(handle, devname, &dev_linkid, NULL, NULL, NULL) !=
-	    DLADM_STATUS_OK)
-		die("invalid link name '%s'", devname);
-
-	if (dladm_parse_link_props(propstr, &proplist, B_FALSE)
-	    != DLADM_STATUS_OK)
+	status = dladm_parse_link_props(propstr, &proplist, B_FALSE);
+	if (status != DLADM_STATUS_OK)
 		die("invalid vnic property");
 
-	status = dladm_vnic_create(handle, name, dev_linkid, mac_addr_type,
-	    mac_addr, maclen, &mac_slot, mac_prefix_len, vid, vrid, af,
-	    &linkid, proplist, &errlist, flags);
+	if (mac_addr != NULL)
+		bcopy(mac_addr, attr.va_mac_addr, sizeof (attr.va_mac_addr));
+
+	func(name, devname, &attr, proplist, flags);
+
+	dladm_free_props(proplist);
+	free(mac_addr);
+}
+
+static void
+do_create_vnic_func(const char *name, const char *devname,
+    dladm_vnic_attr_t *attrp, dladm_arg_list_t *proplist, uint32_t flags)
+{
+	dladm_status_t status;
+
+	if (attrp->va_mac_addr_type == VNIC_MAC_ADDR_TYPE_UNKNOWN)
+		attrp->va_mac_addr_type = VNIC_MAC_ADDR_TYPE_AUTO;
+
+	if (attrp->va_vid == VLAN_ID_NONE)
+		attrp->va_vid = VLAN_ID_UNTAGGED;
+
+	if (attrp->va_link_id == DATALINK_INVALID_LINKID)
+		usage();
+
+	status = dladm_vnic_create(handle, name, attrp, proplist, &errlist,
+	    flags);
+
+
 	switch (status) {
 	case DLADM_STATUS_OK:
 		break;
@@ -4946,9 +5000,12 @@ do_create_vnic(int argc, char *argv[], const char *use)
 		die_dlerrlist(status, &errlist, "vnic creation over %s failed",
 		    devname);
 	}
+}
 
-	dladm_free_props(proplist);
-	free(mac_addr);
+static void
+do_create_vnic(int argc, char *argv[], const char *use)
+{
+	do_common_vnic(argc, argv, use, do_create_vnic_func);
 }
 
 static void
@@ -5248,8 +5305,13 @@ print_vnic(show_vnic_state_t *state, datalink_id_t linkid)
 				    mstr));
 			}
 
-			(void) snprintf(vbuf.vnic_vid, sizeof (vbuf.vnic_vid),
-			    "%d", vnic->va_vid);
+			if (vnic->va_vid != VLAN_ID_UNTAGGED) {
+				(void) snprintf(vbuf.vnic_vid,
+				    sizeof (vbuf.vnic_vid), "%d", vnic->va_vid);
+			} else {
+				(void) snprintf(vbuf.vnic_vid,
+				    sizeof (vbuf.vnic_vid), "untagged");
+			}
 
 			if (zonename[0] != '\0')
 				(void) snprintf(vbuf.vnic_zone,
@@ -5434,15 +5496,15 @@ do_show_vnic(int argc, char *argv[], const char *use)
 static void
 do_create_etherstub(int argc, char *argv[], const char *use)
 {
+	dladm_vnic_attr_t attr;
 	uint32_t flags;
 	char *altroot = NULL;
 	int option;
 	dladm_status_t status;
 	char name[MAXLINKNAMELEN];
-	uchar_t mac_addr[ETHERADDRL];
 
 	name[0] = '\0';
-	bzero(mac_addr, sizeof (mac_addr));
+	bzero(&attr, sizeof (attr));
 	flags = DLADM_OPT_ANCHOR | DLADM_OPT_ACTIVE | DLADM_OPT_PERSIST;
 
 	opterr = 0;
@@ -5473,9 +5535,12 @@ do_create_etherstub(int argc, char *argv[], const char *use)
 	if (altroot != NULL)
 		altroot_cmd(altroot, argc, argv);
 
-	status = dladm_vnic_create(handle, name, DATALINK_INVALID_LINKID,
-	    VNIC_MAC_ADDR_TYPE_AUTO, mac_addr, ETHERADDRL, NULL, 0, 0,
-	    VRRP_VRID_NONE, AF_UNSPEC, NULL, NULL, &errlist, flags);
+	attr.va_link_id = DATALINK_INVALID_LINKID;
+	attr.va_mac_addr_type = VNIC_MAC_ADDR_TYPE_AUTO;
+	attr.va_mac_len = ETHERADDRL;
+	attr.va_vid = VLAN_ID_UNTAGGED;
+
+	status = dladm_vnic_create(handle, name, &attr, NULL, &errlist, flags);
 	if (status != DLADM_STATUS_OK)
 		die_dlerr(status, "etherstub creation failed");
 }
@@ -7701,7 +7766,7 @@ do_show_secobj(int argc, char **argv, const char *use)
 	}
 
 	if (state.ss_parsable && !o_arg)
-		die("option -c requires -o");
+		die("option -p requires -o");
 
 	if (state.ss_parsable && fields_str == all_fields)
 		die("\"-o all\" is invalid with -p");
