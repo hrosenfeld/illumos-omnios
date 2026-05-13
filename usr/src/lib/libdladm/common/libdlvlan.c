@@ -26,6 +26,7 @@
 #include <libdlvlan.h>
 #include <libdlvnic.h>
 #include <libvrrpadm.h>
+#include <strings.h>
 
 /*
  * VLAN Administration Library.
@@ -62,9 +63,17 @@ dladm_vlan_create(dladm_handle_t handle, const char *vlan, datalink_id_t linkid,
     uint16_t vid, dladm_arg_list_t *proplist, uint32_t flags,
     datalink_id_t *vlan_id_out)
 {
-	return (dladm_vnic_create(handle, vlan, linkid,
-	    VNIC_MAC_ADDR_TYPE_PRIMARY, NULL, 0, NULL, 0, vid, VRRP_VRID_NONE,
-	    AF_UNSPEC, vlan_id_out, proplist, NULL, flags | DLADM_OPT_VLAN));
+	dladm_vnic_attr_t attr;
+
+	bzero(&attr, sizeof (attr));
+
+	attr.va_link_id = linkid;
+	attr.va_mac_addr_type = VNIC_MAC_ADDR_TYPE_PRIMARY;
+	attr.va_vid = vid;
+
+	flags |= DLADM_OPT_VLAN;
+
+	return (dladm_vnic_create(handle, vlan, &attr, proplist, NULL, flags));
 }
 
 /*

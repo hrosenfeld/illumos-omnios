@@ -47,8 +47,9 @@ dl_macs["vrrp_inet"]=$(printf "0:0:5e:0:1:%x" ${dl_vrid})
 dl_macs["vrrp_inet6"]=$(printf "0:0:5e:0:2:%x" ${dl_vrid})
 
 typeset -A dl_vlan
-dl_vlan["novlan"]="0"
+dl_vlan["novlan"]="untagged"
 dl_vlan["vlan"]="123"
+dl_vlan["untagged"]="untagged"
 
 typeset -A dl_configs
 # "factory MACs" apparently exist only in nxge(4d), so we expect them to fail
@@ -90,6 +91,7 @@ dl_types["vrrp_inet6"]="vrrp, ${dl_vrid}/inet6"
 typeset -A dl_extra_configs
 dl_extra_configs["novlan"]=""
 dl_extra_configs["vlan"]="-v ${dl_vlan[vlan]}"
+dl_extra_configs["untagged"]="-v ${dl_vlan[untagged]}"
 
 fatal()
 {

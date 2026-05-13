@@ -138,7 +138,7 @@
 .Op Fl d Ar forward-delay
 .Op Fl f Ar force-protocol
 .Oo Fl l Ar link Oc Ns ...
-.Ar bridge-name
+.Ar bridge-link
 .Nm
 .Cm modify-bridge
 .Op Fl R Ar root-dir
@@ -148,29 +148,29 @@
 .Op Fl h Ar hello-time
 .Op Fl d Ar forward-delay
 .Op Fl f Ar force-protocol
-.Ar bridge-name
+.Ar bridge-link
 .Nm
 .Cm delete-bridge
 .Op Fl R Ar root-dir
-.Ar bridge-name
+.Ar bridge-link
 .Nm
 .Cm add-bridge
 .Op Fl R Ar root-dir
 .Fl l Ar link
 .Oo Fl l Ar link Oc Ns ...
-.Ar bridge-name
+.Ar bridge-link
 .Nm
 .Cm remove-bridge
 .Op Fl R Ar root-dir
 .Fl l Ar link
 .Oo Fl l Ar link Oc Ns ...
-.Ar bridge-name
+.Ar bridge-link
 .Nm
 .Cm show-bridge
 .Op Fl flt
 .Op Fl s Op Fl i Ar interval
 .Op Oo Fl p Oc Fl o Ar field Ns Op ,...
-.Ar bridge-name
+.Ar bridge-link
 .\" VLAN
 .Pp
 .Nm
@@ -178,7 +178,7 @@
 .Op Fl ft
 .Op Fl R Ar root-dir
 .Fl l Ar ether-link
-.Fl v Ar vid
+.Fl v Ar vlan-id
 .Op Ar vlan-link
 .Nm
 .Cm delete-vlan
@@ -300,7 +300,7 @@
 .Fl m
 .Ar value |
 .Cm auto |
-.Cm factory Fl n Ar slot-identifier |
+.Cm factory Fl n Ar slot-id |
 .Cm random Oo Fl r Ar prefix Oc |
 .Cm vrrp Fl V Ar vrid Fl A Ar address-family
 .Oc
@@ -425,10 +425,10 @@
 .Nm
 .Cm show-usage
 .Op Fl a
-.Fl f Ar filename
-.Op Fl p Ar plotfile Fl F Ar format
+.Op Fl d | Fl F Ar format
 .Op Fl s Ar time
 .Op Fl e Ar time
+.Fl f Ar logfile
 .Op Ar link
 .Sh DESCRIPTION
 The
@@ -1282,7 +1282,7 @@ If this option is not specified, statistics will be displayed only once.
 .Op Fl d Ar forward-delay
 .Op Fl f Ar force-protocol
 .Oo Fl l Ar link Oc Ns ...
-.Ar bridge-name
+.Ar bridge-link
 .Xc
 .Pp
 Create an 802.1D bridge instance and optionally assign one or more network
@@ -1397,7 +1397,7 @@ the system.
 .Op Fl h Ar hello-time
 .Op Fl d Ar forward-delay
 .Op Fl f Ar force-protocol
-.Ar bridge-name
+.Ar bridge-link
 .Xc
 .Pp
 Modify the operational parameters of an existing bridge.
@@ -1414,7 +1414,7 @@ Bridge parameter modification requires the PRIV_SYS_DL_CONFIG privilege.
 .It Xo
 .Nm Cm delete-bridge
 .Op Fl R Ar root-dir
-.Ar bridge-name
+.Ar bridge-link
 .Xc
 Delete a bridge instance.
 The bridge being deleted must not have any attached links.
@@ -1435,7 +1435,7 @@ subcommand.
 .Op Fl R Ar root-dir
 .Fl l Ar link
 .Oo Fl l Ar link Oc Ns ...
-.Ar bridge-name
+.Ar bridge-link
 .Xc
 .Pp
 Add one or more links to an existing bridge.
@@ -1472,7 +1472,7 @@ subcommand.
 .Op Fl R Ar root-dir
 .Fl l Ar link
 .Oo Fl l Ar link Oc Ns ...
-.Ar bridge-name
+.Ar bridge-link
 .Xc
 .Pp
 Remove one or more links from a bridge instance.
@@ -1489,7 +1489,7 @@ subcommand.
 .Op Fl flt
 .Op Fl s Op Fl i Ar interval
 .Op Oo Fl p Oc Fl o Ar field Ns Op ,...
-.Ar bridge-name
+.Ar bridge-link
 .Xc
 .Pp
 Show the running status and configuration of bridges, their attached links,
@@ -1804,12 +1804,12 @@ fields are shown.
 .Op Fl ft
 .Op Fl R Ar root-dir
 .Fl l Ar ether-link
-.Fl v Ar vid
+.Fl v Ar vlan-id
 .Op Ar vlan-link
 .Xc
 .Pp
 Create a tagged VLAN link with an ID of
-.Ar vid
+.Ar vlan-id
 over Ethernet link
 .Ar ether-link .
 The name of the VLAN link can be specified as
@@ -1822,14 +1822,14 @@ is
 .Pc
 as:
 .Pp
-.D1 Cm < Ns Ar name Ns Cm >< Ns No 1000 Cm \&* Ar vid Cm \&+ Em PPA Ns Cm >
+.D1 Cm < Ns Ar name Ns Cm >< Ns No 1000 Cm \&* Ar vlan-id Cm \&+ Em PPA Ns Cm >
 .Pp
 For example, if
 .Ar ether-link
 is
 .Em bge1
 and
-.Ar vid
+.Ar vlan-id
 is 2, the name generated is
 .Em bge2001 .
 .Bl -tag -width 4n
@@ -2826,7 +2826,7 @@ Display persistent secure object information
 .Fl m
 .Ar value |
 .Cm auto |
-.Cm factory Fl n Ar slot-identifier |
+.Cm factory Fl n Ar slot-id |
 .Cm random Oo Fl r Ar prefix Oc |
 .Cm vrrp Fl V Ar vrid Fl A Ar address-family
 .Oc

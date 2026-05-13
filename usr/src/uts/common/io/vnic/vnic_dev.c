@@ -24,6 +24,7 @@
  * Copyright 2016 OmniTI Computer Consulting, Inc. All rights reserved.
  * Copyright 2020 OmniOS Community Edition (OmniOSce) Association.
  * Copyright 2022 RackTop Systems, Inc.
+ * Copyright 2026 Hans Rosenfeld
  */
 
 #include <sys/types.h>
@@ -58,6 +59,7 @@
 #include <sys/mac_impl.h>
 #include <sys/mac_flow_impl.h>
 #include <inet/ip_impl.h>
+#include <netinet/vrrp.h>
 
 /*
  * Note that for best performance, the VNIC is a passthrough design.
@@ -82,6 +84,14 @@
  * clients are secondary macs.
  */
 
+static vnic_ioc_diag_t vnic_mac2vnic_diag(mac_diag_t);
+static int vnic_unicast_add(vnic_ioc_t *, mac_handle_t, mac_client_handle_t,
+    mac_unicast_handle_t *, boolean_t);
+static int vnic_lower_open(vnic_t *, vnic_ioc_t *, boolean_t);
+static int vnic_lower_setup(vnic_t *, vnic_ioc_t *, uint32_t *);
+static void vnic_lower_teardown(vnic_t *, boolean_t);
+static void vnic_lower_close(vnic_t *);
+
 static int vnic_m_start(void *);
 static void vnic_m_stop(void *);
 static int vnic_m_promisc(void *, boolean_t);
@@ -96,8 +106,15 @@ static void vnic_m_propinfo(void *, const char *, mac_prop_id_t,
     mac_prop_info_handle_t);
 static mblk_t *vnic_m_tx(void *, mblk_t *);
 static boolean_t vnic_m_capab_get(void *, mac_capab_t, void *);
-static void vnic_notify_cb(void *, mac_notify_type_t);
+
+static void *vnic_mac_client_handle(void *);
+static void vnic_mac_secondary_update(void *);
+
 static void vnic_cleanup_secondary_macs(vnic_t *, int);
+static int vnic_set_secondary_macs(vnic_t *, mac_secondary_addr_t *);
+static int vnic_get_secondary_macs(vnic_t *, uint_t, void *);
+
+static void vnic_notify_lower_cb(void *, mac_notify_type_t);
 
 static kmem_cache_t	*vnic_cache;
 static krwlock_t	vnic_lock;
@@ -195,25 +212,86 @@ vnic_mac2vnic_diag(mac_diag_t diag)
 }
 
 static int
-vnic_unicast_add(vnic_t *vnic, vnic_mac_addr_type_t vnic_addr_type,
-    int *addr_slot, uint_t prefix_len, int *addr_len_ptr_arg,
-    uint8_t *mac_addr_arg, uint16_t flags, vnic_ioc_diag_t *diag,
-    uint16_t vid, boolean_t req_hwgrp_flag)
+vnic_unicast_add(vnic_ioc_t *ioc, mac_handle_t mh, mac_client_handle_t mch,
+    mac_unicast_handle_t *muhp, boolean_t reuse_mac_slot)
 {
 	mac_diag_t mac_diag = MAC_DIAG_NONE;
+	mac_unicast_handle_t muh = NULL;
 	uint16_t mac_flags = 0;
 	int err;
-	uint_t addr_len;
 
-	switch (vnic_addr_type) {
-	case VNIC_MAC_ADDR_TYPE_FIXED:
+	/*
+	 * Sanity check VRID and AF for non-VRRP MACs.
+	 */
+	if ((ioc->vi_vrid != VRRP_VRID_NONE || ioc->vi_af != AF_UNSPEC) &&
+	    (ioc->vi_mac_addr_type != VNIC_MAC_ADDR_TYPE_VRID)) {
+		ioc->vi_diag = VNIC_IOC_DIAG_MACADDR_INVALID;
+		return (EINVAL);
+	}
+
+	switch (ioc->vi_mac_addr_type) {
 	case VNIC_MAC_ADDR_TYPE_VRID:
+		if (ioc->vi_vrid < VRRP_VRID_MIN ||
+		    ioc->vi_vrid > VRRP_VRID_MAX ||
+		    (ioc->vi_af != AF_INET && ioc->vi_af != AF_INET6)) {
+			ioc->vi_diag = VNIC_IOC_DIAG_MACADDR_INVALID;
+			return (EINVAL);
+		}
+		/* FALLTHROUGH */
+
+	case VNIC_MAC_ADDR_TYPE_FIXED:
 		/*
-		 * The MAC address value to assign to the VNIC
-		 * is already provided in mac_addr_arg. addr_len_ptr_arg
-		 * already contains the MAC address length.
+		 * The MAC address value to assign to the VNIC is already
+		 * provided in mac_addr. mac_len already contains the MAC
+		 * address length.
 		 */
 		break;
+
+	case VNIC_MAC_ADDR_TYPE_AUTO:
+		ioc->vi_mac_slot = -1;
+		/* first try to allocate a factory MAC address */
+		/* FALLTHROUGH */
+
+	case VNIC_MAC_ADDR_TYPE_FACTORY:
+		/* sanity check the specified slot number */
+		if (ioc->vi_mac_slot < 0 && ioc->vi_mac_slot != -1) {
+			ioc->vi_diag = VNIC_IOC_DIAG_MACFACTORYSLOTINVALID;
+			return (EINVAL);
+		}
+
+		if (ioc->vi_mac_addr_type == VNIC_MAC_ADDR_TYPE_FACTORY &&
+		    reuse_mac_slot) {
+			if (ioc->vi_mac_slot == -1) {
+				ioc->vi_diag =
+				    VNIC_IOC_DIAG_MACFACTORYSLOTINVALID;
+				return (EINVAL);
+			}
+			break;
+		}
+
+		err = mac_addr_factory_reserve(mch, &ioc->vi_mac_slot);
+		if (err == 0) {
+			mac_addr_factory_value(mh, ioc->vi_mac_slot,
+			    ioc->vi_mac_addr, &ioc->vi_mac_len, NULL, NULL);
+			ioc->vi_mac_addr_type = VNIC_MAC_ADDR_TYPE_FACTORY;
+			break;
+		}
+
+		if (err == EINVAL)
+			ioc->vi_diag = VNIC_IOC_DIAG_MACFACTORYSLOTINVALID;
+		else if (err == EBUSY)
+			ioc->vi_diag = VNIC_IOC_DIAG_MACFACTORYSLOTUSED;
+		else if (err == ENOSPC)
+			ioc->vi_diag = VNIC_IOC_DIAG_MACFACTORYSLOTALLUSED;
+
+		if (ioc->vi_mac_addr_type == VNIC_MAC_ADDR_TYPE_FACTORY)
+			return (err);
+
+		/*
+		 * Allocating a factory MAC address failed, generate a
+		 * random MAC address instead.
+		 */
+		/* FALLTHROUGH */
 
 	case VNIC_MAC_ADDR_TYPE_RANDOM:
 		/*
@@ -240,93 +318,247 @@ vnic_unicast_add(vnic_t *vnic, vnic_mac_addr_type_t vnic_addr_type,
 		 */
 
 		/*
-		 * If it's a pre-generated address, we're done. mac_addr_arg
-		 * and addr_len_ptr_arg already contain the MAC address
-		 * value and length.
+		 * If it's a pre-generated address, we're done. mac_addr and
+		 * mac_len already contain the MAC address value and length.
 		 */
-		if (*addr_len_ptr_arg > 0)
+		if (ioc->vi_mac_addr_type == VNIC_MAC_ADDR_TYPE_RANDOM &&
+		    ioc->vi_mac_len > 0)
 			break;
+
+		if (ioc->vi_mac_len > 0 &&
+		    ioc->vi_mac_len != mac_addr_len(mh)) {
+			ioc->vi_diag = VNIC_IOC_DIAG_MACADDRLEN_INVALID;
+			return (EINVAL);
+		}
+
+		/* sanity check the speficied prefix length */
+		if (ioc->vi_mac_prefix_len > MAXMACADDRLEN) {
+			ioc->vi_diag = VNIC_IOC_DIAG_MACPREFIXLEN_INVALID;
+			return (EINVAL);
+		}
 
 		/* generate a new random MAC address */
-		if ((err = mac_addr_random(vnic->vn_mch,
-		    prefix_len, mac_addr_arg, &mac_diag)) != 0) {
-			*diag = vnic_mac2vnic_diag(mac_diag);
-			return (err);
-		}
-		*addr_len_ptr_arg = mac_addr_len(vnic->vn_lower_mh);
-		break;
-
-	case VNIC_MAC_ADDR_TYPE_FACTORY:
-		err = mac_addr_factory_reserve(vnic->vn_mch, addr_slot);
+		err = mac_addr_random(mch, ioc->vi_mac_prefix_len,
+		    ioc->vi_mac_addr, &mac_diag);
 		if (err != 0) {
-			if (err == EINVAL)
-				*diag = VNIC_IOC_DIAG_MACFACTORYSLOTINVALID;
-			if (err == EBUSY)
-				*diag = VNIC_IOC_DIAG_MACFACTORYSLOTUSED;
-			if (err == ENOSPC)
-				*diag = VNIC_IOC_DIAG_MACFACTORYSLOTALLUSED;
+			ioc->vi_diag = vnic_mac2vnic_diag(mac_diag);
 			return (err);
 		}
-
-		mac_addr_factory_value(vnic->vn_lower_mh, *addr_slot,
-		    mac_addr_arg, &addr_len, NULL, NULL);
-		*addr_len_ptr_arg = addr_len;
+		ioc->vi_mac_len = mac_addr_len(mh);
+		ioc->vi_mac_addr_type = VNIC_MAC_ADDR_TYPE_RANDOM;
 		break;
 
-	case VNIC_MAC_ADDR_TYPE_AUTO:
-		/* first try to allocate a factory MAC address */
-		err = mac_addr_factory_reserve(vnic->vn_mch, addr_slot);
-		if (err == 0) {
-			mac_addr_factory_value(vnic->vn_lower_mh, *addr_slot,
-			    mac_addr_arg, &addr_len, NULL, NULL);
-			vnic_addr_type = VNIC_MAC_ADDR_TYPE_FACTORY;
-			*addr_len_ptr_arg = addr_len;
-			break;
-		}
-
-		/*
-		 * Allocating a factory MAC address failed, generate a
-		 * random MAC address instead.
-		 */
-		if ((err = mac_addr_random(vnic->vn_mch,
-		    prefix_len, mac_addr_arg, &mac_diag)) != 0) {
-			*diag = vnic_mac2vnic_diag(mac_diag);
-			return (err);
-		}
-		*addr_len_ptr_arg = mac_addr_len(vnic->vn_lower_mh);
-		vnic_addr_type = VNIC_MAC_ADDR_TYPE_RANDOM;
-		break;
 	case VNIC_MAC_ADDR_TYPE_PRIMARY:
 		/*
 		 * We get the address here since we copy it in the
 		 * vnic's vn_addr.
-		 * We can't ask for hardware resources since we
-		 * don't currently support hardware classification
-		 * for these MAC clients.
 		 */
-		if (req_hwgrp_flag) {
-			*diag = VNIC_IOC_DIAG_NO_HWRINGS;
-			return (ENOTSUP);
-		}
-		mac_unicast_primary_get(vnic->vn_lower_mh, mac_addr_arg);
-		*addr_len_ptr_arg = mac_addr_len(vnic->vn_lower_mh);
+		mac_unicast_primary_get(mh, ioc->vi_mac_addr);
+		ioc->vi_mac_len = mac_addr_len(mh);
 		mac_flags |= MAC_UNICAST_VNIC_PRIMARY;
 		break;
+	default:
+		return (EINVAL);
 	}
 
-	vnic->vn_addr_type = vnic_addr_type;
+	/*
+	 * Sanity check the MAC address length.
+	 */
+	if (ioc->vi_mac_len == 0 || ioc->vi_mac_len > MAXMACADDRLEN) {
+		ioc->vi_diag = VNIC_IOC_DIAG_MACADDRLEN_INVALID;
+		return (EINVAL);
+	}
 
-	err = mac_unicast_add(vnic->vn_mch, mac_addr_arg, mac_flags,
-	    &vnic->vn_muh, vid, &mac_diag);
+	err = mac_unicast_add(mch, ioc->vi_mac_addr, mac_flags,
+	    &muh, ioc->vi_vid, &mac_diag);
 	if (err != 0) {
-		if (vnic_addr_type == VNIC_MAC_ADDR_TYPE_FACTORY) {
+		if (ioc->vi_mac_addr_type == VNIC_MAC_ADDR_TYPE_FACTORY) {
 			/* release factory MAC address */
-			mac_addr_factory_release(vnic->vn_mch, *addr_slot);
+			mac_addr_factory_release(mch, ioc->vi_mac_slot);
 		}
-		*diag = vnic_mac2vnic_diag(mac_diag);
+		ioc->vi_diag = vnic_mac2vnic_diag(mac_diag);
+		return (err);
 	}
+
+	*muhp = muh;
+
+	return (0);
+}
+
+/* Open the lower MAC and get a MAC client handle for the VNIC. */
+static int
+vnic_lower_open(vnic_t *vnic, vnic_ioc_t *ioc, boolean_t reuse_mac_slot)
+{
+	mac_handle_t new_lower_mh = NULL;
+	mac_client_handle_t new_mch = NULL;
+	mac_unicast_handle_t new_muh = NULL;
+	const mac_info_t *minfop;
+	char vnic_name[MAXNAMELEN];
+	int err;
+
+	if (ioc->vi_link_id == DATALINK_INVALID_LINKID)
+		return (EINVAL);
+
+	err = mac_open_by_linkid(ioc->vi_link_id, &new_lower_mh);
+	if (err != 0)
+		return (err);
+
+	/*
+	 * VNIC(vlan) over VNICs(vlans) is not supported.
+	 */
+	if (mac_is_vnic(new_lower_mh)) {
+		err = EINVAL;
+		goto bail;
+	}
+
+	/* only ethernet support for now */
+	minfop = mac_info(new_lower_mh);
+	if (minfop->mi_nativemedia != DL_ETHER) {
+		err = ENOTSUP;
+		goto bail;
+	}
+
+	(void) dls_mgmt_get_linkinfo(ioc->vi_vnic_id, vnic_name, NULL,
+	    NULL, NULL);
+	err = mac_client_open(new_lower_mh, &new_mch,
+	    vnic_name, MAC_OPEN_FLAGS_IS_VNIC);
+	if (err != 0)
+		goto bail;
+
+
+	/* Assign the MAC address to the VNIC. */
+	err = vnic_unicast_add(ioc, new_lower_mh, new_mch, &new_muh,
+	    reuse_mac_slot);
+	if (err != 0)
+		goto bail;
+
+	vnic->vn_lower_mh = new_lower_mh;
+	vnic->vn_mch = new_mch;
+	vnic->vn_muh = new_muh;
+
+	vnic->vn_addr_type = ioc->vi_mac_addr_type;
+	vnic->vn_addr_len = ioc->vi_mac_len;
+	bcopy(ioc->vi_mac_addr, vnic->vn_addr, vnic->vn_addr_len);
+	vnic->vn_slot_id = ioc->vi_mac_slot;
+	vnic->vn_vrid = ioc->vi_vrid;
+	vnic->vn_af = ioc->vi_af;
+	vnic->vn_vid = ioc->vi_vid;
+
+	/* register to receive notification from underlying MAC */
+	vnic->vn_lower_mnh = mac_notify_add(new_lower_mh, vnic_notify_lower_cb,
+	    vnic);
+
+	return (0);
+
+bail:
+	if (new_mch != NULL)
+		mac_client_close(new_mch, MAC_CLOSE_FLAGS_IS_VNIC);
+
+	if (new_lower_mh != NULL)
+		mac_close(new_lower_mh);
 
 	return (err);
+}
+
+static int
+vnic_lower_setup(vnic_t *vnic, vnic_ioc_t *ioc, uint32_t *mtu)
+{
+	int err;
+
+	/*
+	 * Set the initial VNIC capabilities. If the VNIC is created
+	 * over MACs which do not support native vlan, disable the
+	 * VNIC's hardware checksum capability if its VID is not 0,
+	 * since the underlying MAC would get the hardware checksum
+	 * offset wrong in case of VLAN packets.
+	 */
+	vnic->vn_hcksum_txflags = 0;
+	if (ioc->vi_vid != VLAN_ID_UNTAGGED &&
+	    !mac_capab_get(vnic->vn_lower_mh, MAC_CAPAB_NO_NATIVEVLAN, NULL)) {
+		(void) mac_capab_get(vnic->vn_lower_mh, MAC_CAPAB_HCKSUM,
+		    &vnic->vn_hcksum_txflags);
+	}
+
+	/*
+	 * Check for LSO capabilities. LSO implementations depend on
+	 * hardware checksumming, so the same requirement is enforced here.
+	 */
+	vnic->vn_cap_lso.lso_flags = 0;
+	if (vnic->vn_hcksum_txflags != 0) {
+		(void) mac_capab_get(vnic->vn_lower_mh, MAC_CAPAB_LSO,
+		    &vnic->vn_cap_lso);
+	}
+
+	/*
+	 * If this is a VNIC-based VLAN, then we check for the margin unless
+	 * it has been created with the force flag. If we are configuring a
+	 * VLAN over an etherstub, we don't check the margin even if force
+	 * is not set.
+	 */
+	if (ioc->vi_vid == VLAN_ID_UNTAGGED || ioc->vi_force != 0) {
+		if (ioc->vi_vid != VLAN_ID_UNTAGGED)
+			vnic->vn_force = B_TRUE;
+		/*
+		 * As the current margin size of the underlying mac is
+		 * used to determine the margin size of the VNIC itself,
+		 * request the underlying mac not to change to a smaller
+		 * margin size.
+		 */
+		err = mac_margin_add(vnic->vn_lower_mh, &vnic->vn_margin,
+		    B_TRUE);
+		ASSERT(err == 0);
+	} else {
+		vnic->vn_margin = VLAN_TAGSZ;
+		err = mac_margin_add(vnic->vn_lower_mh, &vnic->vn_margin,
+		    B_FALSE);
+		if (err != 0) {
+			ioc->vi_diag = VNIC_IOC_DIAG_MACMARGIN_INVALID;
+			return (err);
+		}
+	}
+
+	err = mac_mtu_add(vnic->vn_lower_mh, mtu, B_FALSE);
+	if (err != 0) {
+		VERIFY0(mac_margin_remove(vnic->vn_lower_mh, vnic->vn_margin));
+		ioc->vi_diag = VNIC_IOC_DIAG_MACMTU_INVALID;
+		return (err);
+	}
+
+	return (0);
+}
+
+static void
+vnic_lower_teardown(vnic_t *vnic, boolean_t reuse_mac_slot)
+{
+	if (vnic->vn_lower_mh != NULL && vnic->vn_mtu != 0) {
+		(void) mac_margin_remove(vnic->vn_lower_mh, vnic->vn_margin);
+		(void) mac_mtu_remove(vnic->vn_lower_mh, vnic->vn_mtu);
+	}
+
+	/*
+	 * Check if the old MAC address for the vnic was obtained from the
+	 * factory MAC addresses. If yes, release it.
+	 */
+	if (vnic->vn_mch != NULL &&
+	    vnic->vn_addr_type == VNIC_MAC_ADDR_TYPE_FACTORY &&
+	    !reuse_mac_slot)
+		(void) mac_addr_factory_release(vnic->vn_mch, vnic->vn_slot_id);
+}
+
+static void
+vnic_lower_close(vnic_t *vnic)
+{
+	if (vnic->vn_lower_mnh != NULL)
+		(void) mac_notify_remove(vnic->vn_lower_mnh, B_TRUE);
+
+	if (vnic->vn_muh != NULL)
+		(void) mac_unicast_remove(vnic->vn_mch, vnic->vn_muh);
+
+	if (vnic->vn_mch != NULL)
+		mac_client_close(vnic->vn_mch, MAC_CLOSE_FLAGS_IS_VNIC);
+
+	if (vnic->vn_lower_mh != NULL)
+		mac_close(vnic->vn_lower_mh);
 }
 
 /*
@@ -335,26 +567,19 @@ vnic_unicast_add(vnic_t *vnic, vnic_mac_addr_type_t vnic_addr_type,
  */
 /* ARGSUSED */
 int
-vnic_dev_create(datalink_id_t vnic_id, datalink_id_t linkid,
-    vnic_mac_addr_type_t *vnic_addr_type, int *mac_len, uchar_t *mac_addr,
-    int *mac_slot, uint_t mac_prefix_len, uint16_t vid, vrid_t vrid,
-    int af, mac_resource_props_t *mrp, uint32_t flags, vnic_ioc_diag_t *diag,
-    cred_t *credp)
+vnic_dev_create(vnic_ioc_t *ioc, cred_t *credp)
 {
+	boolean_t is_anchor = ((ioc->vi_flags & VNIC_IOC_FLAGS_ANCHOR) != 0);
+	mac_register_t *mac = NULL;
 	vnic_t *vnic;
-	mac_register_t *mac;
 	int err;
-	boolean_t is_anchor = ((flags & VNIC_IOC_CREATE_ANCHOR) != 0);
-	char vnic_name[MAXNAMELEN];
-	const mac_info_t *minfop;
-	uint32_t req_hwgrp_flag = B_FALSE;
 
-	*diag = VNIC_IOC_DIAG_NONE;
+	ioc->vi_diag = VNIC_IOC_DIAG_NONE;
 
 	rw_enter(&vnic_lock, RW_WRITER);
 
 	/* Does a VNIC with the same id already exist? */
-	err = mod_hash_find(vnic_hash, VNIC_HASH_KEY(vnic_id),
+	err = mod_hash_find(vnic_hash, VNIC_HASH_KEY(ioc->vi_vnic_id),
 	    (mod_hash_val_t *)&vnic);
 	if (err == 0) {
 		rw_exit(&vnic_lock);
@@ -370,110 +595,20 @@ vnic_dev_create(datalink_id_t vnic_id, datalink_id_t linkid,
 	bzero(vnic, sizeof (*vnic));
 
 	vnic->vn_ls = LINK_STATE_UNKNOWN;
-	vnic->vn_id = vnic_id;
-	vnic->vn_link_id = linkid;
-	vnic->vn_vrid = vrid;
-	vnic->vn_af = af;
+	vnic->vn_id = ioc->vi_vnic_id;
 
-	if (!is_anchor) {
-		if (linkid == DATALINK_INVALID_LINKID) {
-			err = EINVAL;
-			goto bail;
-		}
+	if (ioc->vi_vid == VLAN_ID_UNTAGGED)
+		ioc->vi_vid = VLAN_ID_NONE;
 
-		/*
-		 * Open the lower MAC and assign its initial bandwidth and
-		 * MAC address. We do this here during VNIC creation and
-		 * do not wait until the upper MAC client open so that we
-		 * can validate the VNIC creation parameters (bandwidth,
-		 * MAC address, etc) and reserve a factory MAC address if
-		 * one was requested.
-		 */
-		err = mac_open_by_linkid(linkid, &vnic->vn_lower_mh);
-		if (err != 0)
-			goto bail;
-
-		/*
-		 * VNIC(vlan) over VNICs(vlans) is not supported.
-		 */
-		if (mac_is_vnic(vnic->vn_lower_mh)) {
-			err = EINVAL;
-			goto bail;
-		}
-
-		/* only ethernet support for now */
-		minfop = mac_info(vnic->vn_lower_mh);
-		if (minfop->mi_nativemedia != DL_ETHER) {
-			err = ENOTSUP;
-			goto bail;
-		}
-
-		(void) dls_mgmt_get_linkinfo(vnic_id, vnic_name, NULL, NULL,
-		    NULL);
-		err = mac_client_open(vnic->vn_lower_mh, &vnic->vn_mch,
-		    vnic_name, MAC_OPEN_FLAGS_IS_VNIC);
-		if (err != 0)
-			goto bail;
-
-		/* assign a MAC address to the VNIC */
-
-		err = vnic_unicast_add(vnic, *vnic_addr_type, mac_slot,
-		    mac_prefix_len, mac_len, mac_addr, flags, diag, vid,
-		    req_hwgrp_flag);
-		if (err != 0) {
-			vnic->vn_muh = NULL;
-			if (diag != NULL && req_hwgrp_flag)
-				*diag = VNIC_IOC_DIAG_NO_HWRINGS;
-			goto bail;
-		}
-
-		/* register to receive notification from underlying MAC */
-		vnic->vn_mnh = mac_notify_add(vnic->vn_lower_mh, vnic_notify_cb,
-		    vnic);
-
-		*vnic_addr_type = vnic->vn_addr_type;
-		vnic->vn_addr_len = *mac_len;
-		vnic->vn_vid = vid;
-
-		bcopy(mac_addr, vnic->vn_addr, vnic->vn_addr_len);
-
-		if (vnic->vn_addr_type == VNIC_MAC_ADDR_TYPE_FACTORY)
-			vnic->vn_slot_id = *mac_slot;
-
-		/*
-		 * Set the initial VNIC capabilities. If the VNIC is created
-		 * over MACs which does not support nactive vlan, disable
-		 * VNIC's hardware checksum capability if its VID is not 0,
-		 * since the underlying MAC would get the hardware checksum
-		 * offset wrong in case of VLAN packets.
-		 */
-		if (vid == 0 || !mac_capab_get(vnic->vn_lower_mh,
-		    MAC_CAPAB_NO_NATIVEVLAN, NULL)) {
-			if (!mac_capab_get(vnic->vn_lower_mh, MAC_CAPAB_HCKSUM,
-			    &vnic->vn_hcksum_txflags))
-				vnic->vn_hcksum_txflags = 0;
-		} else {
-			vnic->vn_hcksum_txflags = 0;
-		}
-
-		/*
-		 * Check for LSO capabilities. LSO implementations
-		 * depend on hardware checksumming, so the same
-		 * requirement is enforced here.
-		 */
-		if (vnic->vn_hcksum_txflags != 0) {
-			if (!mac_capab_get(vnic->vn_lower_mh, MAC_CAPAB_LSO,
-			    &vnic->vn_cap_lso)) {
-				vnic->vn_cap_lso.lso_flags = 0;
-			}
-		} else {
-			vnic->vn_cap_lso.lso_flags = 0;
-		}
+	/* Check whether a VLAN ID was given. */
+	if (ioc->vi_vid > VLAN_ID_MAX) {
+		err = EINVAL;
+		/* ioc->vi_diag = VNIC_IOC_DIAG_VID_INVALID; */
+		goto bail;
 	}
 
-	/* register with the MAC module */
-	if ((mac = mac_alloc(MAC_VERSION)) == NULL)
-		goto bail;
+	mac = mac_alloc(MAC_VERSION);
+	VERIFY(mac != NULL);
 
 	mac->m_type_ident = MAC_PLUGIN_IDENT_ETHER;
 	mac->m_driver = vnic;
@@ -484,103 +619,66 @@ vnic_dev_create(datalink_id_t vnic_id, datalink_id_t linkid,
 
 	if (!is_anchor) {
 		/*
-		 * If this is a VNIC based VLAN, then we check for the
-		 * margin unless it has been created with the force
-		 * flag. If we are configuring a VLAN over an etherstub,
-		 * we don't check the margin even if force is not set.
+		 * Open the lower MAC and assign its initial bandwidth and
+		 * MAC address. We do this here during VNIC creation and
+		 * do not wait until the upper MAC client open so that we
+		 * can validate the VNIC creation parameters (bandwidth,
+		 * MAC address, etc) and reserve a factory MAC address if
+		 * one was requested.
 		 */
-		if (vid == 0 || (flags & VNIC_IOC_CREATE_FORCE) != 0) {
-			if (vid != VLAN_ID_NONE)
-				vnic->vn_force = B_TRUE;
-			/*
-			 * As the current margin size of the underlying mac is
-			 * used to determine the margin size of the VNIC
-			 * itself, request the underlying mac not to change
-			 * to a smaller margin size.
-			 */
-			err = mac_margin_add(vnic->vn_lower_mh,
-			    &vnic->vn_margin, B_TRUE);
-			ASSERT(err == 0);
-		} else {
-			vnic->vn_margin = VLAN_TAGSZ;
-			err = mac_margin_add(vnic->vn_lower_mh,
-			    &vnic->vn_margin, B_FALSE);
-			if (err != 0) {
-				mac_free(mac);
-				if (diag != NULL)
-					*diag = VNIC_IOC_DIAG_MACMARGIN_INVALID;
-				goto bail;
-			}
-		}
+		err = vnic_lower_open(vnic, ioc, B_FALSE);
+		if (err != 0)
+			goto bail;
 
 		mac_sdu_get(vnic->vn_lower_mh, &mac->m_min_sdu,
 		    &mac->m_max_sdu);
-		err = mac_mtu_add(vnic->vn_lower_mh, &mac->m_max_sdu, B_FALSE);
-		if (err != 0) {
-			VERIFY(mac_margin_remove(vnic->vn_lower_mh,
-			    vnic->vn_margin) == 0);
-			mac_free(mac);
-			if (diag != NULL)
-				*diag = VNIC_IOC_DIAG_MACMTU_INVALID;
+
+		err = vnic_lower_setup(vnic, ioc, &mac->m_max_sdu);
+		if (err != 0)
 			goto bail;
-		}
-		vnic->vn_mtu = mac->m_max_sdu;
 	} else {
 		vnic->vn_margin = VLAN_TAGSZ;
 		mac->m_min_sdu = 1;
 		mac->m_max_sdu = ANCHOR_VNIC_MAX_MTU;
-		vnic->vn_mtu = ANCHOR_VNIC_MAX_MTU;
 	}
+	vnic->vn_mtu = mac->m_max_sdu;
 
 	mac->m_margin = vnic->vn_margin;
 
+	vnic->vn_link_id = ioc->vi_link_id;
+
+	/* register with the MAC module */
 	err = mac_register(mac, &vnic->vn_mh);
 	mac_free(mac);
-	if (err != 0) {
-		if (!is_anchor) {
-			VERIFY(mac_mtu_remove(vnic->vn_lower_mh,
-			    vnic->vn_mtu) == 0);
-			VERIFY(mac_margin_remove(vnic->vn_lower_mh,
-			    vnic->vn_margin) == 0);
-		}
+	mac = NULL;
+	if (err != 0)
 		goto bail;
-	}
 
-	/* Set the VNIC's MAC in the client */
 	if (!is_anchor) {
-		mac_set_upper_mac(vnic->vn_mch, vnic->vn_mh, mrp);
+		/* Set the VNIC's MAC in the client */
+		mac_set_upper_mac(vnic->vn_mch, vnic->vn_mh,
+		    &ioc->vi_resource_props);
 
-		if (mrp != NULL) {
-			if ((mrp->mrp_mask & MRP_RX_RINGS) != 0 ||
-			    (mrp->mrp_mask & MRP_TX_RINGS) != 0) {
-				req_hwgrp_flag = B_TRUE;
-			}
-			err = mac_client_set_resources(vnic->vn_mch, mrp);
-			if (err != 0) {
-				VERIFY(mac_mtu_remove(vnic->vn_lower_mh,
-				    vnic->vn_mtu) == 0);
-				VERIFY(mac_margin_remove(vnic->vn_lower_mh,
-				    vnic->vn_margin) == 0);
-				(void) mac_unregister(vnic->vn_mh);
-				goto bail;
-			}
+		if (ioc->vi_mac_addr_type == VNIC_MAC_ADDR_TYPE_PRIMARY &&
+		    ((ioc->vi_resource_props.mrp_mask & MRP_RX_RINGS) != 0 ||
+		    (ioc->vi_resource_props.mrp_mask & MRP_TX_RINGS) != 0)) {
+			err = ENOTSUP;
+			ioc->vi_diag = VNIC_IOC_DIAG_NO_HWRINGS;
+			goto bail;
 		}
+
+		err = mac_client_set_resources(vnic->vn_mch,
+		    &ioc->vi_resource_props);
+		if (err != 0)
+			goto bail;
 	}
 
 	err = dls_devnet_create(vnic->vn_mh, vnic->vn_id, crgetzoneid(credp));
-	if (err != 0) {
-		if (!is_anchor) {
-			VERIFY(mac_mtu_remove(vnic->vn_lower_mh,
-			    vnic->vn_mtu) == 0);
-			VERIFY(mac_margin_remove(vnic->vn_lower_mh,
-			    vnic->vn_margin) == 0);
-		}
-		(void) mac_unregister(vnic->vn_mh);
+	if (err != 0)
 		goto bail;
-	}
 
 	/* add new VNIC to hash table */
-	err = mod_hash_insert(vnic_hash, VNIC_HASH_KEY(vnic_id),
+	err = mod_hash_insert(vnic_hash, VNIC_HASH_KEY(ioc->vi_vnic_id),
 	    (mod_hash_val_t)vnic);
 	ASSERT(err == 0);
 	vnic_count++;
@@ -597,6 +695,9 @@ vnic_dev_create(datalink_id_t vnic_id, datalink_id_t linkid,
 		vnic->vn_ls = mac_client_stat_get(vnic->vn_mch,
 		    MAC_STAT_LINK_STATE);
 	}
+
+	ioc->vi_vid = MAC_VLAN_UNTAGGED_VID(vnic->vn_vid);
+
 	mac_link_update(vnic->vn_mh, vnic->vn_ls);
 
 	rw_exit(&vnic_lock);
@@ -605,15 +706,16 @@ vnic_dev_create(datalink_id_t vnic_id, datalink_id_t linkid,
 
 bail:
 	rw_exit(&vnic_lock);
+
+	if (mac != NULL)
+		mac_free(mac);
+
+	if (vnic->vn_mh != NULL)
+		(void) mac_unregister(vnic->vn_mh);
+
 	if (!is_anchor) {
-		if (vnic->vn_mnh != NULL)
-			(void) mac_notify_remove(vnic->vn_mnh, B_TRUE);
-		if (vnic->vn_muh != NULL)
-			(void) mac_unicast_remove(vnic->vn_mch, vnic->vn_muh);
-		if (vnic->vn_mch != NULL)
-			mac_client_close(vnic->vn_mch, MAC_CLOSE_FLAGS_IS_VNIC);
-		if (vnic->vn_lower_mh != NULL)
-			mac_close(vnic->vn_lower_mh);
+		vnic_lower_teardown(vnic, B_FALSE);
+		vnic_lower_close(vnic);
 	}
 
 	kmem_cache_free(vnic_cache, vnic);
@@ -625,15 +727,13 @@ bail:
  */
 /* ARGSUSED */
 int
-vnic_dev_modify(datalink_id_t vnic_id, uint_t modify_mask,
-    vnic_mac_addr_type_t mac_addr_type, uint_t mac_len, uchar_t *mac_addr,
-    uint_t mac_slot, mac_resource_props_t *mrp)
+vnic_dev_modify(vnic_ioc_t *ioc, cred_t *credp)
 {
 	vnic_t *vnic = NULL;
 
 	rw_enter(&vnic_lock, RW_WRITER);
 
-	if (mod_hash_find(vnic_hash, VNIC_HASH_KEY(vnic_id),
+	if (mod_hash_find(vnic_hash, VNIC_HASH_KEY(ioc->vi_vnic_id),
 	    (mod_hash_val_t *)&vnic) != 0) {
 		rw_exit(&vnic_lock);
 		return (ENOENT);
@@ -646,7 +746,7 @@ vnic_dev_modify(datalink_id_t vnic_id, uint_t modify_mask,
 
 /* ARGSUSED */
 int
-vnic_dev_delete(datalink_id_t vnic_id, uint32_t flags, cred_t *credp)
+vnic_dev_delete(vnic_ioc_t *ioc, cred_t *credp)
 {
 	vnic_t *vnic = NULL;
 	mod_hash_val_t val;
@@ -655,7 +755,7 @@ vnic_dev_delete(datalink_id_t vnic_id, uint32_t flags, cred_t *credp)
 
 	rw_enter(&vnic_lock, RW_WRITER);
 
-	if (mod_hash_find(vnic_hash, VNIC_HASH_KEY(vnic_id),
+	if (mod_hash_find(vnic_hash, VNIC_HASH_KEY(ioc->vi_vnic_id),
 	    (mod_hash_val_t *)&vnic) != 0) {
 		rw_exit(&vnic_lock);
 		return (ENOENT);
@@ -666,7 +766,7 @@ vnic_dev_delete(datalink_id_t vnic_id, uint32_t flags, cred_t *credp)
 		return (rc);
 	}
 
-	ASSERT(vnic_id == tmpid);
+	ASSERT(ioc->vi_vnic_id == tmpid);
 
 	/*
 	 * We cannot unregister the MAC yet. Unregistering would
@@ -675,7 +775,7 @@ vnic_dev_delete(datalink_id_t vnic_id, uint32_t flags, cred_t *credp)
 	 * any new claims on mac_impl_t.
 	 */
 	if ((rc = mac_disable(vnic->vn_mh)) != 0) {
-		(void) dls_devnet_create(vnic->vn_mh, vnic_id,
+		(void) dls_devnet_create(vnic->vn_mh, ioc->vi_vnic_id,
 		    crgetzoneid(credp));
 		rw_exit(&vnic_lock);
 		return (rc);
@@ -684,7 +784,7 @@ vnic_dev_delete(datalink_id_t vnic_id, uint32_t flags, cred_t *credp)
 	vnic_cleanup_secondary_macs(vnic, vnic->vn_nhandles);
 
 	vnic->vn_enabled = B_FALSE;
-	(void) mod_hash_remove(vnic_hash, VNIC_HASH_KEY(vnic_id), &val);
+	(void) mod_hash_remove(vnic_hash, VNIC_HASH_KEY(ioc->vi_vnic_id), &val);
 	ASSERT(vnic == (vnic_t *)val);
 	vnic_count--;
 	rw_exit(&vnic_lock);
@@ -697,23 +797,54 @@ vnic_dev_delete(datalink_id_t vnic_id, uint32_t flags, cred_t *credp)
 	(void) mac_unregister(vnic->vn_mh);
 
 	if (vnic->vn_lower_mh != NULL) {
-		/*
-		 * Check if MAC address for the vnic was obtained from the
-		 * factory MAC addresses. If yes, release it.
-		 */
-		if (vnic->vn_addr_type == VNIC_MAC_ADDR_TYPE_FACTORY) {
-			(void) mac_addr_factory_release(vnic->vn_mch,
-			    vnic->vn_slot_id);
-		}
-		(void) mac_margin_remove(vnic->vn_lower_mh, vnic->vn_margin);
-		(void) mac_mtu_remove(vnic->vn_lower_mh, vnic->vn_mtu);
-		(void) mac_notify_remove(vnic->vn_mnh, B_TRUE);
-		(void) mac_unicast_remove(vnic->vn_mch, vnic->vn_muh);
-		mac_client_close(vnic->vn_mch, MAC_CLOSE_FLAGS_IS_VNIC);
-		mac_close(vnic->vn_lower_mh);
+		vnic_lower_teardown(vnic, B_FALSE);
+		vnic_lower_close(vnic);
 	}
 
 	kmem_cache_free(vnic_cache, vnic);
+	return (0);
+}
+
+int
+vnic_dev_info(vnic_ioc_t *ioc, cred_t *credp)
+{
+	vnic_t		*vnic;
+	int		err;
+
+	/* Make sure that the VNIC link is visible from the caller's zone. */
+	if (!dls_devnet_islinkvisible(ioc->vi_vnic_id, crgetzoneid(credp)))
+		return (ENOENT);
+
+	rw_enter(&vnic_lock, RW_WRITER);
+
+	err = mod_hash_find(vnic_hash, VNIC_HASH_KEY(ioc->vi_vnic_id),
+	    (mod_hash_val_t *)&vnic);
+	if (err != 0) {
+		rw_exit(&vnic_lock);
+		return (ENOENT);
+	}
+
+	bzero(ioc, sizeof (vnic_ioc_t));
+	ioc->vi_vnic_id = vnic->vn_id;
+	ioc->vi_link_id = vnic->vn_link_id;
+	ioc->vi_mac_addr_type = vnic->vn_addr_type;
+	ioc->vi_mac_len = vnic->vn_addr_len;
+	bcopy(vnic->vn_addr, ioc->vi_mac_addr, MAXMACADDRLEN);
+	ioc->vi_mac_prefix_len = 0;
+	ioc->vi_mac_slot = vnic->vn_slot_id;
+	ioc->vi_vid = MAC_VLAN_UNTAGGED_VID(vnic->vn_vid);
+	ioc->vi_force = vnic->vn_force;
+	ioc->vi_flags = vnic->vn_link_id == DATALINK_INVALID_LINKID ?
+	    VNIC_IOC_FLAGS_ANCHOR : 0;
+	ioc->vi_vrid = vnic->vn_vrid;
+	ioc->vi_af = vnic->vn_af;
+	ioc->vi_diag = VNIC_IOC_DIAG_NONE;
+
+	if (vnic->vn_mch != NULL)
+		mac_client_get_resources(vnic->vn_mch,
+		    &ioc->vi_resource_props);
+
+	rw_exit(&vnic_lock);
 	return (0);
 }
 
@@ -1241,51 +1372,13 @@ vnic_m_propinfo(void *m_driver, const char *pr_name,
 			mac_prop_info_set_default_str(prh, buf);
 		}
 		break;
+	default:
+		break;
 	}
-}
-
-
-int
-vnic_info(vnic_info_t *info, cred_t *credp)
-{
-	vnic_t		*vnic;
-	int		err;
-
-	/* Make sure that the VNIC link is visible from the caller's zone. */
-	if (!dls_devnet_islinkvisible(info->vn_vnic_id, crgetzoneid(credp)))
-		return (ENOENT);
-
-	rw_enter(&vnic_lock, RW_WRITER);
-
-	err = mod_hash_find(vnic_hash, VNIC_HASH_KEY(info->vn_vnic_id),
-	    (mod_hash_val_t *)&vnic);
-	if (err != 0) {
-		rw_exit(&vnic_lock);
-		return (ENOENT);
-	}
-
-	info->vn_link_id = vnic->vn_link_id;
-	info->vn_mac_addr_type = vnic->vn_addr_type;
-	info->vn_mac_len = vnic->vn_addr_len;
-	bcopy(vnic->vn_addr, info->vn_mac_addr, MAXMACADDRLEN);
-	info->vn_mac_slot = vnic->vn_slot_id;
-	info->vn_mac_prefix_len = 0;
-	info->vn_vid = vnic->vn_vid;
-	info->vn_force = vnic->vn_force;
-	info->vn_vrid = vnic->vn_vrid;
-	info->vn_af = vnic->vn_af;
-
-	bzero(&info->vn_resource_props, sizeof (mac_resource_props_t));
-	if (vnic->vn_mch != NULL)
-		mac_client_get_resources(vnic->vn_mch,
-		    &info->vn_resource_props);
-
-	rw_exit(&vnic_lock);
-	return (0);
 }
 
 static void
-vnic_notify_cb(void *arg, mac_notify_type_t type)
+vnic_notify_lower_cb(void *arg, mac_notify_type_t type)
 {
 	vnic_t *vnic = arg;
 

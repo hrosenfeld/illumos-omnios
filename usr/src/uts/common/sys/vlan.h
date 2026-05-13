@@ -50,6 +50,7 @@ extern "C" {
 #define	VLAN_PRI_SIZE	3
 #define	VLAN_PRI_SHIFT	(VLAN_CFI_SHIFT + VLAN_CFI_SIZE)
 
+#define	VLAN_ID_UNTAGGED	UINT16_MAX
 #define	VLAN_ID_NONE	0
 #define	VLAN_ID_MIN	1
 #define	VLAN_ID_MAX	4094
