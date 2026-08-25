@@ -25,6 +25,7 @@
 # Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
 # Copyright 2014 Nexenta Systems, Inc. All rights reserved.
 # Copyright (c) 2011, Joyent, Inc. All rights reserved.
+# Copyright 2026 EFit Partners
 #
 
 PROG= zoneadmd
@@ -43,7 +44,7 @@ CFLAGS += $(CCVERBOSE)
 
 LDLIBS += -lsocket -lzonecfg -lnsl -ldevinfo -ldevice -lnvpair \
 	-lgen -lbsm -lcontract -lzfs -luuid -lbrand -ldladm -ltsnet -ltsol \
-	-linetutil -lscf
+	-linetutil -lscf -lsysevent
 XGETFLAGS += -a -x zoneadmd.xcl
 
 .KEEP_STATE:
