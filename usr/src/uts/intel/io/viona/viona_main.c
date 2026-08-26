@@ -899,6 +899,7 @@ viona_ioc_create(viona_soft_state_t *ss, void *dptr, int md, cred_t *cr)
 	}
 
 	link = kmem_zalloc(sizeof (viona_link_t), KM_SLEEP);
+	link->l_ss = ss;
 	link->l_linkid = kvc.c_linkid;
 	link->l_vm_hold = hold;
 	link->l_mtu = VIONA_DEFAULT_MTU;

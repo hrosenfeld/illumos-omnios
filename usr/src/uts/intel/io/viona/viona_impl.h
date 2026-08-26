@@ -67,6 +67,8 @@ struct viona_desb;
 typedef struct viona_desb viona_desb_t;
 struct viona_net;
 typedef struct viona_neti viona_neti_t;
+struct viona_soft_state;
+typedef struct viona_soft_state viona_soft_state_t;
 
 typedef struct viona_transfer_stats {
 	/* Packets transferred successfully */
@@ -207,6 +209,8 @@ typedef struct viona_link_params {
 } viona_link_params_t;
 
 struct viona_link {
+	viona_soft_state_t	*l_ss;
+
 	vmm_hold_t		*l_vm_hold;
 	boolean_t		l_destroyed;
 
@@ -298,13 +302,13 @@ typedef struct iov_bunch {
 	uint32_t	ib_remain;
 } iov_bunch_t;
 
-typedef struct viona_soft_state {
+struct viona_soft_state {
 	kmutex_t		ss_lock;
 	viona_link_t		*ss_link;
 	list_node_t		ss_node;
 	kstat_t			*ss_kstat;
 	minor_t			ss_minor;
-} viona_soft_state_t;
+};
 
 #pragma pack(1)
 struct virtio_desc {
